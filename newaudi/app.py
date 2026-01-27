@@ -1,13 +1,14 @@
 """
-Single-Panel Lighting + Audio Controller (Clean UI)
+Single-Panel Lighting + Audio Controller (Clean UI) — UI Upgraded Edition
+- Top status bar with LIVE/REC/BLACKOUT pills + DMX indicator + audio status
 - Built-in FX buttons (toggle-off by clicking again): wave, pulse, flash, strobe, lightning, rainbow, chase, blackout
 - Sliders: dimmer (intensity), RGB, strobe rate, PAN, TILT
 - Toggles:
     - AUTO (Audio-driven): mixes FX + your chosen RGB, audio-reactive intensity
     - AUTO PAN/TILT (BPM): moving-head movement from BPM (locks PAN/TILT sliders)
-    - DMX Output
+    - DMX Output (with config drawer)
 - Presets: record, stop, save, load (JSON snapshot of current UI state)
-- Audio: import WAV, play, stop, replay + simple visualizer
+- Audio: import WAV, play, stop, replay + progress + simple visualizer
 - Big right panel: light simulation (works even without hardware)
 - Optional DMX Output (Art-Net / sACN) via dmx_output.py if present
 
@@ -22,6 +23,13 @@ Install:
 
 Optional (DMX):
   Put dmx_output.py in the same folder as this file.
+
+Keyboard shortcuts:
+- Space: Play/Stop audio
+- R: Record
+- S: Stop recording
+- B: Toggle Blackout FX
+- 1..8: FX select (Lightning, Rainbow, Chase, Blackout, Wave, Pulse, Flash, Strobe)
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import queue
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Tuple
 
@@ -78,23 +87,27 @@ except Exception:
 try:
     from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer, QRect, QPointF, QSize
     from PyQt6.QtGui import (
-        QFont, QPainter, QColor, QPen, QPolygonF, QRadialGradient, QLinearGradient, QBrush
+        QFont, QPainter, QColor, QPen, QPolygonF, QRadialGradient, QLinearGradient, QBrush,
+        QKeySequence, QShortcut
     )
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QToolButton,
         QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QSizePolicy, QButtonGroup,
-        QSlider, QLineEdit, QMessageBox, QFileDialog, QAbstractButton
+        QSlider, QLineEdit, QMessageBox, QFileDialog, QAbstractButton, QColorDialog,
+        QComboBox, QSpinBox
     )
     QT6 = True
 except Exception:
     from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer, QRect, QPointF, QSize
     from PyQt5.QtGui import (
-        QFont, QPainter, QColor, QPen, QPolygonF, QRadialGradient, QLinearGradient, QBrush
+        QFont, QPainter, QColor, QPen, QPolygonF, QRadialGradient, QLinearGradient, QBrush,
+        QKeySequence
     )
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QToolButton,
         QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QSizePolicy, QButtonGroup,
-        QSlider, QLineEdit, QMessageBox, QFileDialog, QAbstractButton
+        QSlider, QLineEdit, QMessageBox, QFileDialog, QAbstractButton, QColorDialog,
+        QComboBox, QSpinBox, QShortcut
     )
     QT6 = False
 
@@ -116,9 +129,10 @@ QLabel#PanelTitle {
     color: #D6D9DE;
     font-weight: 600;
     padding: 2px 2px;
+    font-size: 13px;
 }
 
-QLabel#Subtle { color: #A9B0BA; }
+QLabel#Subtle { color: #A9B0BA; font-size: 11px; }
 
 QToolButton, QPushButton {
     background: #23272D;
@@ -128,11 +142,16 @@ QToolButton, QPushButton {
 }
 QToolButton:hover, QPushButton:hover { border-color: #3C4452; }
 QToolButton:checked {
-    background: #2D3642;
-    border-color: #5B89B8;
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #314256, stop:1 #233041);
+    border: 1px solid #74A6D9;
 }
-QPushButton#Primary { border-color: #5B89B8; }
-QPushButton#Danger  { border-color: #B85B5B; }
+QPushButton#Primary { border-color: #74A6D9; background: #263546; }
+QPushButton#Danger  { border-color: #D97474; background: #3A2020; }
+QPushButton:disabled, QToolButton:disabled {
+    color: #6F7783;
+    border-color: #2A3038;
+    background: #1A1E24;
+}
 
 QLineEdit {
     background: #121417;
@@ -181,7 +200,24 @@ QSlider::handle:vertical {
 }
 
 QSlider::handle:vertical:hover {
-    border: 1px solid #5B89B8;
+    border: 1px solid #74A6D9;
+}
+
+/* Tooltips */
+QToolTip {
+    background: #0F1114;
+    color: #E6E6E6;
+    border: 1px solid #323844;
+    padding: 6px 8px;
+    border-radius: 8px;
+}
+
+/* Splitter handle */
+QSplitter::handle {
+    background: #15171A;
+}
+QSplitter::handle:hover {
+    background: #1F2329;
 }
 """
 
@@ -251,6 +287,70 @@ class Panel(QFrame):
         self.body.setContentsMargins(0, 0, 0, 0)
         self.body.setSpacing(10)
         outer.addLayout(self.body)
+
+
+class SliderWell(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SliderWell")
+
+
+class StatusPill(QLabel):
+    def __init__(self, text="LIVE", parent=None):
+        super().__init__(text, parent)
+        self.setObjectName("StatusPill")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter if QT6 else Qt.AlignCenter)
+        self.setMinimumHeight(26)
+        self.setMinimumWidth(78)
+        self.setStyleSheet("QLabel { border-radius: 13px; padding: 4px 10px; font-weight: 700; }")
+        self.set_state("live")
+
+    def set_state(self, mode: str):
+        mode = (mode or "").lower()
+        if mode == "rec":
+            self.setText("REC ●")
+            self.setStyleSheet("QLabel { background:#3A2020; border:1px solid #D97474; border-radius:13px; padding:4px 10px; font-weight:800; }")
+        elif mode == "blackout":
+            self.setText("BLACKOUT")
+            self.setStyleSheet("QLabel { background:#121417; border:1px solid #6F7783; border-radius:13px; padding:4px 10px; font-weight:800; }")
+        else:
+            self.setText("LIVE")
+            self.setStyleSheet("QLabel { background:#1F2F22; border:1px solid #77C48A; border-radius:13px; padding:4px 10px; font-weight:800; }")
+
+
+class DotIndicator(QLabel):
+    def __init__(self, parent=None):
+        super().__init__("  ", parent)
+        self.setFixedSize(14, 14)
+        self.setStyleSheet("QLabel { border-radius: 7px; background:#2A3038; border:1px solid #323844; }")
+
+    def set_on(self, on: bool, color: str = "#74A6D9"):
+        if on:
+            self.setStyleSheet(f"QLabel {{ border-radius: 7px; background:{color}; border:1px solid {color}; }}")
+        else:
+            self.setStyleSheet("QLabel { border-radius: 7px; background:#2A3038; border:1px solid #323844; }")
+
+
+class ColorSwatch(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SliderWell")
+        self.setFixedHeight(24)
+        self._rgb = (0, 120, 255)
+
+    def set_rgb(self, r: int, g: int, b: int):
+        self._rgb = (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
+        self.update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing if QT6 else QPainter.Antialiasing)
+        r = self.rect().adjusted(6, 6, -6, -6)
+        p.setPen(QPen(QColor(60, 70, 85, 140), 1))
+        p.setBrush(QColor(*self._rgb, 255))
+        p.drawRoundedRect(r, 8, 8)
+        p.end()
 
 
 class ToggleSwitch(QAbstractButton):
@@ -334,12 +434,6 @@ class ToggleSwitch(QAbstractButton):
         p.end()
 
 
-class SliderWell(QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("SliderWell")
-
-
 # ----------------------------- Simple Visualizer -----------------------------
 class SimpleVisualizer(QFrame):
     def __init__(self, nbars: int = 64, parent=None):
@@ -397,9 +491,10 @@ class SimpleVisualizer(QFrame):
         p.end()
 
 
-# ----------------------------- Audio WAV Worker (with BPM estimation) -----------------------------
+# ----------------------------- Audio WAV Worker (FFT off callback + BPM estimation) -----------------------------
 class AudioFileWorker(QObject):
     features = pyqtSignal(object)   # AudioFeatures
+    progress = pyqtSignal(float, float)  # pos_sec, total_sec
     error = pyqtSignal(str)
     running = pyqtSignal(bool)
 
@@ -413,13 +508,24 @@ class AudioFileWorker(QObject):
         self._sr = 48000
         self._idx = 0
 
-        self._last_emit = 0.0
         self._emit_hz = 30.0
         self._prev_rms = 0.0
 
         self._onset_times: List[float] = []
         self._bpm_ema: float = 0.0
         self._bpm_alpha: float = 0.15
+
+        self._analysis_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
+        self._analysis_timer: Optional[QTimer] = None
+        self._last_progress_emit = 0.0
+
+    def start_analysis_timer(self):
+        if self._analysis_timer is not None:
+            return
+        self._analysis_timer = QTimer()
+        self._analysis_timer.setInterval(int(1000 / self._emit_hz))
+        self._analysis_timer.timeout.connect(self._process_analysis)
+        self._analysis_timer.start()
 
     def load_wav(self, path: str):
         try:
@@ -432,8 +538,17 @@ class AudioFileWorker(QObject):
             self._prev_rms = 0.0
             self._onset_times.clear()
             self._bpm_ema = 0.0
+            self._drain_analysis()
+            self._emit_progress(force=True)
         except Exception as e:
             self.error.emit(f"Failed to load WAV: {e}")
+
+    def _drain_analysis(self):
+        try:
+            while True:
+                self._analysis_q.get_nowait()
+        except Exception:
+            pass
 
     def play(self):
         if self._audio is None:
@@ -464,13 +579,13 @@ class AudioFileWorker(QObject):
                 outdata[:] = 0.0
                 outdata[:len(chunk)] = chunk
                 self._idx = end
-                self._emit_features(chunk)
+                self._push_for_analysis(chunk)
                 self._stop_flag = True
                 raise sd.CallbackStop()
 
             outdata[:] = chunk
             self._idx = end
-            self._emit_features(chunk)
+            self._push_for_analysis(chunk)
 
         try:
             self._stream = sd.OutputStream(
@@ -504,13 +619,52 @@ class AudioFileWorker(QObject):
         self._prev_rms = 0.0
         self._onset_times.clear()
         self._bpm_ema = 0.0
+        self._drain_analysis()
+        self._emit_progress(force=True)
         self.play()
 
-    def _emit_features(self, chunk: np.ndarray):
+    def _push_for_analysis(self, chunk: np.ndarray):
         if chunk is None or len(chunk) < 64:
             return
+        try:
+            if self._analysis_q.full():
+                try:
+                    self._analysis_q.get_nowait()
+                except Exception:
+                    pass
+            # Copy to detach from underlying audio buffer slice lifetimes
+            self._analysis_q.put_nowait(np.array(chunk, copy=True))
+        except Exception:
+            pass
 
-        mono = chunk.mean(axis=1)
+    def _emit_progress(self, force: bool = False):
+        if self._audio is None:
+            return
+        now = time.time()
+        if (not force) and (now - self._last_progress_emit < 0.10):
+            return
+        self._last_progress_emit = now
+        total = float(self._audio.shape[0] / max(1, self._sr))
+        pos = float(self._idx / max(1, self._sr))
+        self.progress.emit(pos, total)
+
+    def _process_analysis(self):
+        if self._audio is None:
+            return
+
+        latest = None
+        try:
+            while True:
+                latest = self._analysis_q.get_nowait()
+        except Exception:
+            pass
+
+        self._emit_progress()
+
+        if latest is None or len(latest) < 64:
+            return
+
+        mono = latest.mean(axis=1)
         feat, self._prev_rms = compute_features_from_mono(mono, self._sr, self._prev_rms)
 
         now_m = time.monotonic()
@@ -536,11 +690,7 @@ class AudioFileWorker(QObject):
                 self._bpm_ema = (1.0 - self._bpm_alpha) * self._bpm_ema + self._bpm_alpha * bpm
 
         feat.bpm = float(self._bpm_ema)
-
-        now = time.time()
-        if now - self._last_emit >= (1.0 / self._emit_hz):
-            self._last_emit = now
-            self.features.emit(feat)
+        self.features.emit(feat)
 
 
 # ----------------------------- Lighting / FX -----------------------------
@@ -551,7 +701,7 @@ FX_LIST = ["Wave", "Pulse", "Flash", "Strobe", "Lightning", "Rainbow", "Chase", 
 class ControlState:
     fx: str = ""
     auto_audio: bool = False
-    auto_move: bool = False      # NEW: auto PAN/TILT from BPM (locks sliders)
+    auto_move: bool = False
     intensity: int = 80
     r: int = 0
     g: int = 120
@@ -593,7 +743,6 @@ class FxEngine:
         self._lightning_until = 0.0
         self._strobe_phase = 0.0
         self._chase_phase = 0.0
-
         self._move_phase_pan = 0.0
         self._move_phase_tilt = 0.0
 
@@ -633,7 +782,7 @@ class FxEngine:
             if feat.peak > 0.018:
                 self._lightning_until = max(self._lightning_until, t + 0.06)
 
-        # NEW: Movement only if auto_move is ON
+        # Movement only if auto_move is ON
         if state.auto_move and feat is not None:
             bpm = float(getattr(feat, "bpm", 0.0) or 0.0)
             if bpm > 0.0:
@@ -735,14 +884,17 @@ class SimulationWidget(QFrame):
         self._fx_name = "Off"
         self._pan = 270
         self._tilt = 90
+        self._legend = ""
 
-    def set_state(self, intensity_0_100: int, r: int, g: int, b: int, strobe_on: bool, fx_name: str, pan: int, tilt: int):
+    def set_state(self, intensity_0_100: int, r: int, g: int, b: int, strobe_on: bool,
+                  fx_name: str, pan: int, tilt: int, legend: str = ""):
         self._intensity = int(max(0, min(100, intensity_0_100)))
         self._rgb = (int(max(0, min(255, r))), int(max(0, min(255, g))), int(max(0, min(255, b))))
         self._strobe_on = bool(strobe_on)
         self._fx_name = (fx_name or "Off")
         self._pan = int(np.clip(pan, 0, 540))
         self._tilt = int(np.clip(tilt, 0, 180))
+        self._legend = legend or ""
         self.update()
 
     @staticmethod
@@ -766,7 +918,12 @@ class SimulationWidget(QFrame):
         p.fillRect(R, QBrush(vign))
 
         p.setPen(QPen(QColor(214, 217, 222, 180), 1))
-        p.drawText(R.left() + 10, R.top() + 22, f"Simulation — FX: {self._fx_name}   |   Pan: {self._pan}°   Tilt: {self._tilt}°")
+        p.drawText(R.left() + 10, R.top() + 22,
+                   f"Simulation — FX: {self._fx_name}   |   Pan: {self._pan}°   Tilt: {self._tilt}°")
+
+        if self._legend:
+            p.setPen(QPen(QColor(169, 176, 186, 180), 1))
+            p.drawText(R.left() + 10, R.top() + 44, self._legend)
 
         intensity = self._intensity / 100.0
         r, g, b = self._rgb
@@ -807,7 +964,8 @@ class SimulationWidget(QFrame):
             p.setBrush(QColor(28, 32, 38, 220))
             p.drawRoundedRect(base, 10, 10)
 
-            p.setPen(QPen(QColor(90, 100, 115, 140), 5, Qt.PenStyle.SolidLine if QT6 else Qt.SolidLine,
+            p.setPen(QPen(QColor(90, 100, 115, 140), 5,
+                          Qt.PenStyle.SolidLine if QT6 else Qt.SolidLine,
                           Qt.PenCapStyle.RoundCap if QT6 else Qt.RoundCap))
             p.drawLine(fx_x - base_w // 3, truss_y + base_h // 2, fx_x - base_w // 3, truss_y + base_h // 2 + yoke_h)
             p.drawLine(fx_x + base_w // 3, truss_y + base_h // 2, fx_x + base_w // 3, truss_y + base_h // 2 + yoke_h)
@@ -826,7 +984,6 @@ class SimulationWidget(QFrame):
             p.setBrush(QColor(35, 40, 48, 230))
             p.drawEllipse(QPointF(head_cx, head_cy), head_r, head_r)
 
-            # Lens glow always visible (but smaller when "beam off")
             glow_int = (0.35 + 0.65 * intensity) if has_value else 0.15
             if not draw_beam:
                 glow_int *= 0.35
@@ -835,7 +992,8 @@ class SimulationWidget(QFrame):
             p.setBrush(QColor(r, g, b, lens_a))
             p.drawEllipse(QPointF(head_cx, head_cy), head_r * 0.55, head_r * 0.55)
 
-            p.setPen(QPen(QColor(210, 220, 235, 90), 3, Qt.PenStyle.SolidLine if QT6 else Qt.SolidLine,
+            p.setPen(QPen(QColor(210, 220, 235, 90), 3,
+                          Qt.PenStyle.SolidLine if QT6 else Qt.SolidLine,
                           Qt.PenCapStyle.RoundCap if QT6 else Qt.RoundCap))
             p.drawLine(QPointF(head_cx, head_cy), QPointF(head_cx + ux * head_r * 1.2, head_cy + uy * head_r * 1.2))
 
@@ -875,16 +1033,13 @@ class SimulationWidget(QFrame):
 
         if not has_value:
             p.setPen(QPen(QColor(120, 130, 145, 140), 1))
-            p.drawText(R.left() + 10, R.top() + 44, "OFF (raise DIMMER or choose a color)")
-            # still draw bodies (no beam)
+            p.drawText(R.left() + 10, R.top() + 64, "OFF (raise DIMMER or choose a color)")
             draw_head(fx1_x, spot1_x, spot_y, draw_beam=False)
             draw_head(fx2_x, spot2_x, spot_y, draw_beam=False)
             p.end()
             return
 
-        # draw_beam is what strobes — not the head body
         draw_beam = bool(self._strobe_on)
-
         draw_head(fx1_x, spot1_x, spot_y, draw_beam=draw_beam)
         draw_head(fx2_x, spot2_x, spot_y, draw_beam=draw_beam)
 
@@ -906,6 +1061,8 @@ class SinglePanel(QWidget):
     stop_clicked = pyqtSignal()
     replay_clicked = pyqtSignal()
 
+    dmx_config_changed = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -916,10 +1073,66 @@ class SinglePanel(QWidget):
         self._rec_start_monotonic: Optional[float] = None
         self._rec_elapsed_sec: float = 0.0
 
-        root = QHBoxLayout(self)
+        root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
+        # -------- Top Bar --------
+        topbar = QFrame()
+        topbar.setObjectName("Panel")
+        topbar_l = QHBoxLayout(topbar)
+        topbar_l.setContentsMargins(14, 10, 14, 10)
+        topbar_l.setSpacing(12)
+
+        self.pill = StatusPill("LIVE")
+        topbar_l.addWidget(self.pill)
+
+        self.time_lbl = QLabel("00:00")
+        self.time_lbl.setFont(QFont("Consolas" if QT6 else "Courier New", 12, 700))
+        self.time_lbl.setObjectName("PanelTitle")
+        topbar_l.addWidget(self.time_lbl)
+
+        self.top_fx_lbl = QLabel("FX: Off")
+        self.top_fx_lbl.setObjectName("Subtle")
+        topbar_l.addWidget(self.top_fx_lbl)
+
+        topbar_l.addStretch(1)
+
+        # Quick Blackout
+        self.btn_blackout = QPushButton("BLACKOUT")
+        self.btn_blackout.setObjectName("Danger")
+        self.btn_blackout.setToolTip("Toggle Blackout FX (shortcut: B)")
+        topbar_l.addWidget(self.btn_blackout)
+
+        # DMX indicator
+        self.dmx_dot = DotIndicator()
+        self.dmx_lbl = QLabel("DMX")
+        self.dmx_lbl.setObjectName("Subtle")
+        dmx_stack = QHBoxLayout()
+        dmx_stack.setSpacing(8)
+        dmx_stack.addWidget(self.dmx_dot)
+        dmx_stack.addWidget(self.dmx_lbl)
+        w_dmx = QWidget()
+        w_dmx.setLayout(dmx_stack)
+        w_dmx.setStyleSheet("background: transparent;")
+        topbar_l.addWidget(w_dmx)
+
+        # Audio status
+        self.audio_dot = DotIndicator()
+        self.audio_lbl = QLabel("Audio: idle")
+        self.audio_lbl.setObjectName("Subtle")
+        aud_stack = QHBoxLayout()
+        aud_stack.setSpacing(8)
+        aud_stack.addWidget(self.audio_dot)
+        aud_stack.addWidget(self.audio_lbl)
+        w_aud = QWidget()
+        w_aud.setLayout(aud_stack)
+        w_aud.setStyleSheet("background: transparent;")
+        topbar_l.addWidget(w_aud)
+
+        root.addWidget(topbar)
+
+        # Main splitter
         split = QSplitter(Qt.Orientation.Horizontal if QT6 else Qt.Horizontal)
         split.setChildrenCollapsible(False)
         root.addWidget(split, 1)
@@ -933,17 +1146,9 @@ class SinglePanel(QWidget):
         top_panel = Panel("Show Controls")
         left_lay.addWidget(top_panel, 0)
 
-        status_row = QHBoxLayout()
-        self.time_lbl = QLabel("00:00")
-        self.time_lbl.setFont(QFont("Arial", 12, 700))
-        self.time_lbl.setObjectName("PanelTitle")
-        self.status_lbl = QLabel("FX: Off")
+        self.status_lbl = QLabel("Ready")
         self.status_lbl.setObjectName("Subtle")
-        status_row.addWidget(self.time_lbl)
-        status_row.addSpacing(10)
-        status_row.addWidget(self.status_lbl)
-        status_row.addStretch(1)
-        top_panel.body.addLayout(status_row)
+        top_panel.body.addWidget(self.status_lbl)
 
         rec_row = QHBoxLayout()
         rec_row.setSpacing(10)
@@ -953,6 +1158,11 @@ class SinglePanel(QWidget):
         self.btn_stoprec.setObjectName("Danger")
         self.btn_save = QPushButton("SAVE")
         self.btn_load = QPushButton("LOAD")
+
+        self.btn_record.setToolTip("Start timecode and mark recording (shortcut: R)")
+        self.btn_stoprec.setToolTip("Stop recording (shortcut: S)")
+        self.btn_save.setToolTip("Enabled only after STOP following a RECORD")
+        self.btn_load.setToolTip("Load a JSON preset snapshot")
 
         for b in (self.btn_record, self.btn_stoprec, self.btn_save, self.btn_load):
             b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -972,19 +1182,44 @@ class SinglePanel(QWidget):
         fx_grid = QGridLayout()
         fx_grid.setSpacing(10)
 
+        # UX order + icons + shortcuts 1..8
+        fx_order = [
+            ("Lightning", "⚡ LIGHTNING", "1"),
+            ("Rainbow",   "🌈 RAINBOW",   "2"),
+            ("Chase",     "🏃 CHASE",     "3"),
+            ("Blackout",  "⛔ BLACKOUT",  "4"),
+            ("Wave",      "〰️ WAVE",      "5"),
+            ("Pulse",     "💓 PULSE",     "6"),
+            ("Flash",     "💥 FLASH",     "7"),
+            ("Strobe",    "✨ STROBE",    "8"),
+        ]
+
         self.fx_buttons: Dict[str, QToolButton] = {}
-        order = ["Lightning", "Rainbow", "Chase", "Blackout", "Wave", "Pulse", "Flash", "Strobe"]
-        for i, name in enumerate(order):
+        for i, (name, label, key) in enumerate(fx_order):
             btn = QToolButton()
-            btn.setText(name.upper())
+            btn.setText(label)
             btn.setCheckable(True)
             btn.setMinimumHeight(56)
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.setToolTip(f"{name} (shortcut: {key})")
             self.fx_group.addButton(btn, i)
             self.fx_buttons[name] = btn
             fx_grid.addWidget(btn, i // 4, i % 4)
 
         fx_panel.body.addLayout(fx_grid)
+
+        tooltips = {
+            "Lightning": "Cold white flicker burst. AUTO audio can trigger it on peaks.",
+            "Rainbow": "Continuously cycles hue over time.",
+            "Chase": "Alternates bright/dim rhythmically.",
+            "Blackout": "Forces dimmer to 0. Output off.",
+            "Wave": "Slow intensity undulation.",
+            "Pulse": "Medium-rate intensity pulse.",
+            "Flash": "Full white hit. AUTO audio can trigger it on peaks.",
+            "Strobe": "Uses STROBE slider rate (or default).",
+        }
+        for name, btn in self.fx_buttons.items():
+            btn.setToolTip(tooltips.get(name, ""))
 
         for btn in self.fx_buttons.values():
             btn.clicked.connect(lambda checked, b=btn: self._on_fx_clicked(b, checked))
@@ -992,16 +1227,15 @@ class SinglePanel(QWidget):
         slider_panel = Panel("Sliders")
         left_lay.addWidget(slider_panel, 1)
 
-        # ---- CENTERED + EVEN slider bank ----
         slider_box = QWidget()
         slider_box_lay = QHBoxLayout(slider_box)
         slider_box_lay.setContentsMargins(0, 0, 0, 0)
         slider_box_lay.setSpacing(12)
 
-        def make_vslider(title: str, rng: Tuple[int, int], val: int, tick_interval: int = 0) -> Tuple[QWidget, QSlider, QLabel]:
+        def make_vslider(title: str, rng: Tuple[int, int], val: int, tip: str = "") -> Tuple[QWidget, QSlider, QLabel, QLabel]:
             well = SliderWell()
             well.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            well.setFixedSize(92, 340)  # <--- EVEN size (w,h)
+            well.setFixedSize(92, 340)
 
             v = QVBoxLayout(well)
             v.setContentsMargins(12, 12, 12, 12)
@@ -1010,33 +1244,49 @@ class SinglePanel(QWidget):
             lab = QLabel(title)
             lab.setObjectName("Subtle")
             lab.setAlignment(Qt.AlignmentFlag.AlignHCenter if QT6 else Qt.AlignHCenter)
+            if tip:
+                lab.setToolTip(tip)
 
             s = QSlider(Qt.Orientation.Vertical if QT6 else Qt.Vertical)
             s.setRange(rng[0], rng[1])
             s.setValue(val)
             s.setMinimumHeight(250)
             s.setTickPosition(QSlider.TickPosition.NoTicks if QT6 else QSlider.NoTicks)
-            if tick_interval > 0:
-                s.setTickInterval(tick_interval)
 
             ro = QLabel(str(val))
             ro.setObjectName("Subtle")
             ro.setAlignment(Qt.AlignmentFlag.AlignHCenter if QT6 else Qt.AlignHCenter)
 
+            ro_eff = QLabel("")  # optional effective readout
+            ro_eff.setObjectName("Subtle")
+            ro_eff.setAlignment(Qt.AlignmentFlag.AlignHCenter if QT6 else Qt.AlignHCenter)
+
             v.addWidget(lab)
             v.addWidget(s, 1)
             v.addWidget(ro)
-            return well, s, ro
+            v.addWidget(ro_eff)
+            return well, s, ro, ro_eff
 
-        w_dim, self.s_dim, self.ro_dim = make_vslider("DIMMER", (0, 100), self.state.intensity)
-        w_r, self.s_r, self.ro_r = make_vslider("RED", (0, 255), self.state.r)
-        w_g, self.s_g, self.ro_g = make_vslider("GREEN", (0, 255), self.state.g)
-        w_b, self.s_b, self.ro_b = make_vslider("BLUE", (0, 255), self.state.b)
-        w_st, self.s_strobe, self.ro_st = make_vslider("STROBE", (0, 20), self.state.strobe_rate)
-        w_pan, self.s_pan, self.ro_pan = make_vslider("PAN", (0, 540), self.state.pan)
-        w_tilt, self.s_tilt, self.ro_tilt = make_vslider("TILT", (0, 180), self.state.tilt)
+        w_dim, self.s_dim, self.ro_dim, self.ro_dim_eff = make_vslider("DIMMER", (0, 100), self.state.intensity, "Master intensity")
+        w_r, self.s_r, self.ro_r, _ = make_vslider("RED", (0, 255), self.state.r, "Base color red channel")
+        w_g, self.s_g, self.ro_g, _ = make_vslider("GREEN", (0, 255), self.state.g, "Base color green channel")
+        w_b, self.s_b, self.ro_b, _ = make_vslider("BLUE", (0, 255), self.state.b, "Base color blue channel")
+        w_st, self.s_strobe, self.ro_st, _ = make_vslider("STROBE", (0, 20), self.state.strobe_rate, "Strobe rate (0=off)")
+        w_pan, self.s_pan, self.ro_pan, self.ro_pan_eff = make_vslider("PAN", (0, 540), self.state.pan, "Pan degrees (locked in AUTO PAN/TILT)")
+        w_tilt, self.s_tilt, self.ro_tilt, self.ro_tilt_eff = make_vslider("TILT", (0, 180), self.state.tilt, "Tilt degrees (locked in AUTO PAN/TILT)")
 
-        for w in (w_dim, w_r, w_g, w_b, w_st, w_pan, w_tilt):
+        # group spacing: Intensity + Color | Strobe | Movement
+        for w in (w_dim, w_r, w_g, w_b):
+            slider_box_lay.addWidget(w)
+
+        slider_box_lay.addSpacing(10)
+
+        for w in (w_st,):
+            slider_box_lay.addWidget(w)
+
+        slider_box_lay.addSpacing(10)
+
+        for w in (w_pan, w_tilt):
             slider_box_lay.addWidget(w)
 
         slider_outer = QHBoxLayout()
@@ -1048,18 +1298,33 @@ class SinglePanel(QWidget):
         )
         slider_panel.body.addLayout(slider_outer)
 
-        # Toggles
+        # Color swatch + picker
+        color_row = QHBoxLayout()
+        color_row.setSpacing(10)
+        color_row.addWidget(QLabel("Color:"))
+        self.swatch = ColorSwatch()
+        color_row.addWidget(self.swatch, 1)
+        self.btn_pick = QPushButton("PICK")
+        self.btn_pick.setToolTip("Open a color picker to set RGB sliders")
+        color_row.addWidget(self.btn_pick)
+        slider_panel.body.addLayout(color_row)
+
+        # Toggles row
         opts_row = QHBoxLayout()
         opts_row.setSpacing(18)
 
         self.auto_toggle = ToggleSwitch("AUTO (Audio-driven)")
         self.auto_toggle.setChecked(False)
 
-        self.auto_move_toggle = ToggleSwitch("AUTO PAN/TILT (BPM)")   # NEW
+        self.auto_move_toggle = ToggleSwitch("AUTO PAN/TILT (BPM)")
         self.auto_move_toggle.setChecked(False)
 
         self.dmx_enable = ToggleSwitch("DMX Output")
         self.dmx_enable.setChecked(False)
+        if not HAS_DMX:
+            self.dmx_enable.setToolTip("dmx_output.py not found — output runs in stub mode")
+        else:
+            self.dmx_enable.setToolTip("Enable network DMX output via dmx_output.py")
 
         opts_row.addWidget(self.auto_toggle)
         opts_row.addWidget(self.auto_move_toggle)
@@ -1067,6 +1332,7 @@ class SinglePanel(QWidget):
         opts_row.addStretch(1)
         slider_panel.body.addLayout(opts_row)
 
+        # Preset name
         pname_row = QHBoxLayout()
         pname_row.setSpacing(10)
         self.preset_name = QLineEdit(self.state.preset_name)
@@ -1074,6 +1340,58 @@ class SinglePanel(QWidget):
         pname_row.addWidget(QLabel("Preset:"))
         pname_row.addWidget(self.preset_name, 1)
         slider_panel.body.addLayout(pname_row)
+
+        # ---- DMX config drawer ----
+        self.dmx_drawer = Panel("DMX Output Settings")
+        self.dmx_drawer.setVisible(False)
+
+        dmx_grid = QGridLayout()
+        dmx_grid.setSpacing(10)
+
+        self.dmx_proto = QComboBox()
+        if HAS_DMX:
+            self.dmx_proto.addItems(["off", "artnet", "sacn"])
+        else:
+            self.dmx_proto.addItems(["off"])
+        self.dmx_proto.setToolTip("Protocol")
+        dmx_grid.addWidget(QLabel("Protocol"), 0, 0)
+        dmx_grid.addWidget(self.dmx_proto, 0, 1)
+
+        self.dmx_ip = QLineEdit("255.255.255.255")
+        self.dmx_ip.setToolTip("Target IP (broadcast or node IP)")
+        dmx_grid.addWidget(QLabel("Target IP"), 1, 0)
+        dmx_grid.addWidget(self.dmx_ip, 1, 1)
+
+        self.dmx_univ = QSpinBox()
+        self.dmx_univ.setRange(0, 32767)
+        self.dmx_univ.setValue(0)
+        self.dmx_univ.setToolTip("Art-Net universe (0-based)")
+        dmx_grid.addWidget(QLabel("Art-Net Univ"), 2, 0)
+        dmx_grid.addWidget(self.dmx_univ, 2, 1)
+
+        self.dmx_sacn_univ = QSpinBox()
+        self.dmx_sacn_univ.setRange(1, 63999)
+        self.dmx_sacn_univ.setValue(1)
+        self.dmx_sacn_univ.setToolTip("sACN universe (1-based)")
+        dmx_grid.addWidget(QLabel("sACN Univ"), 3, 0)
+        dmx_grid.addWidget(self.dmx_sacn_univ, 3, 1)
+
+        self.dmx_start = QSpinBox()
+        self.dmx_start.setRange(1, 512)
+        self.dmx_start.setValue(1)
+        self.dmx_start.setToolTip("Start address (1..512)")
+        dmx_grid.addWidget(QLabel("Start Addr"), 4, 0)
+        dmx_grid.addWidget(self.dmx_start, 4, 1)
+
+        self.dmx_fps = QSpinBox()
+        self.dmx_fps.setRange(1, 60)
+        self.dmx_fps.setValue(30)
+        self.dmx_fps.setToolTip("DMX frame rate")
+        dmx_grid.addWidget(QLabel("FPS"), 5, 0)
+        dmx_grid.addWidget(self.dmx_fps, 5, 1)
+
+        self.dmx_drawer.body.addLayout(dmx_grid)
+        slider_panel.body.addWidget(self.dmx_drawer)
 
         left_lay.addStretch(1)
 
@@ -1092,13 +1410,24 @@ class SinglePanel(QWidget):
         audio_panel = Panel("Music / Audio")
         right_lay.addWidget(audio_panel, 0)
 
-        bpm_row = QHBoxLayout()
-        bpm_row.setSpacing(10)
+        # BPM + audio time row
+        top_audio_row = QHBoxLayout()
+        top_audio_row.setSpacing(10)
         self.bpm_lbl = QLabel("BPM: --")
         self.bpm_lbl.setObjectName("Subtle")
-        bpm_row.addWidget(self.bpm_lbl)
-        bpm_row.addStretch(1)
-        audio_panel.body.addLayout(bpm_row)
+        self.pos_lbl = QLabel("00:00 / 00:00")
+        self.pos_lbl.setObjectName("Subtle")
+        top_audio_row.addWidget(self.bpm_lbl)
+        top_audio_row.addStretch(1)
+        top_audio_row.addWidget(self.pos_lbl)
+        audio_panel.body.addLayout(top_audio_row)
+
+        # Progress bar (read-only display)
+        self.progress_bar = QSlider(Qt.Orientation.Horizontal if QT6 else Qt.Horizontal)
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setEnabled(False)
+        audio_panel.body.addWidget(self.progress_bar)
 
         self.visualizer = SimpleVisualizer(nbars=64)
         audio_panel.body.addWidget(self.visualizer)
@@ -1112,6 +1441,11 @@ class SinglePanel(QWidget):
 
         self.btn_play.setObjectName("Primary")
         self.btn_stop.setObjectName("Danger")
+
+        self.btn_play.setToolTip("Play (Space)")
+        self.btn_stop.setToolTip("Stop (Space)")
+        self.btn_replay.setToolTip("Replay from start")
+        self.btn_import.setToolTip("Import a WAV file")
 
         audio_row.addWidget(self.btn_play)
         audio_row.addWidget(self.btn_stop)
@@ -1149,11 +1483,57 @@ class SinglePanel(QWidget):
         self.btn_save.clicked.connect(self._save_preset_dialog)
         self.btn_load.clicked.connect(self._load_preset_dialog)
 
+        self.btn_pick.clicked.connect(self._pick_color)
+        self.btn_blackout.clicked.connect(self._toggle_blackout)
+
+        # DMX drawer signals
+        for w in (self.dmx_proto, self.dmx_ip, self.dmx_univ, self.dmx_sacn_univ, self.dmx_start, self.dmx_fps):
+            if isinstance(w, QLineEdit):
+                w.textChanged.connect(self.dmx_config_changed.emit)
+            else:
+                w.currentIndexChanged.connect(self.dmx_config_changed.emit) if isinstance(w, QComboBox) else w.valueChanged.connect(self.dmx_config_changed.emit)
+
         self._sync_record_ui()
         self._on_controls_changed()
 
+    # ---------- Color picker ----------
+    def _pick_color(self):
+        col = QColorDialog.getColor(QColor(self.state.r, self.state.g, self.state.b), self, "Pick Color")
+        if not col.isValid():
+            return
+        self.s_r.setValue(int(col.red()))
+        self.s_g.setValue(int(col.green()))
+        self.s_b.setValue(int(col.blue()))
+
+    # ---------- Blackout toggle ----------
+    def _toggle_blackout(self):
+        # Toggle blackout as FX (and sync button state)
+        if (self.state.fx or "").lower() == "blackout":
+            # turn off
+            if "Blackout" in self.fx_buttons:
+                self.fx_buttons["Blackout"].setChecked(False)
+            self.state.fx = ""
+            self._active_fx_btn = None
+            self.top_fx_lbl.setText("FX: Off")
+            self.status_lbl.setText("FX: Off")
+        else:
+            # enable
+            if "Blackout" in self.fx_buttons:
+                self.fx_buttons["Blackout"].click()
+
     # ---------- FX toggle-off ----------
     def _on_fx_clicked(self, btn: QToolButton, checked: bool):
+        # strip emoji and uppercase
+        raw = btn.text().replace("⚡", "").replace("🌈", "").replace("🏃", "").replace("⛔", "").replace("〰️", "").replace("💓", "").replace("💥", "").replace("✨", "")
+        label = raw.strip().title()
+        # "Lightning" etc. Make sure we keep canonical
+        canonical = None
+        for name in FX_LIST:
+            if name.lower() in label.lower():
+                canonical = name
+                break
+        canonical = canonical or ""
+
         if checked:
             if self._active_fx_btn is not None and self._active_fx_btn is not btn:
                 self._active_fx_btn.blockSignals(True)
@@ -1161,12 +1541,14 @@ class SinglePanel(QWidget):
                 self._active_fx_btn.blockSignals(False)
 
             self._active_fx_btn = btn
-            self.state.fx = btn.text().strip().title()
+            self.state.fx = canonical
+            self.top_fx_lbl.setText(f"FX: {self.state.fx}")
             self.status_lbl.setText(f"FX: {self.state.fx}")
         else:
             if self._active_fx_btn is btn:
                 self._active_fx_btn = None
             self.state.fx = ""
+            self.top_fx_lbl.setText("FX: Off")
             self.status_lbl.setText("FX: Off")
 
     # ---------- Controls ----------
@@ -1195,6 +1577,19 @@ class SinglePanel(QWidget):
         self.ro_pan.setText(str(self.state.pan))
         self.ro_tilt.setText(str(self.state.tilt))
 
+        self.swatch.set_rgb(self.state.r, self.state.g, self.state.b)
+
+        # DMX drawer visible only when enabled
+        self.dmx_drawer.setVisible(self.dmx_enable.isChecked())
+
+        # Update top pill if blackout
+        if (self.state.fx or "").lower() == "blackout":
+            self.pill.set_state("blackout")
+        elif self.is_recording:
+            self.pill.set_state("rec")
+        else:
+            self.pill.set_state("live")
+
     # ---------- Recording / Timecode ----------
     def _sync_record_ui(self):
         self.btn_save.setEnabled(self.can_save)
@@ -1214,6 +1609,7 @@ class SinglePanel(QWidget):
         self._rec_start_monotonic = time.monotonic()
         self._rec_elapsed_sec = 0.0
         self.status_lbl.setText("Recording… (press STOP to finish)")
+        self.pill.set_state("rec")
         self._sync_record_ui()
 
     def _record_stop(self):
@@ -1225,10 +1621,12 @@ class SinglePanel(QWidget):
             self._rec_elapsed_sec = max(0.0, time.monotonic() - self._rec_start_monotonic)
         self._rec_start_monotonic = None
 
-        if self.state.fx:
-            self.status_lbl.setText(f"Stopped (ready to SAVE) — FX: {self.state.fx}")
+        fx_txt = f"FX: {self.state.fx}" if self.state.fx else "FX: Off"
+        self.status_lbl.setText(f"Captured {self.time_lbl.text()} — Ready to SAVE — {fx_txt}")
+        if (self.state.fx or "").lower() == "blackout":
+            self.pill.set_state("blackout")
         else:
-            self.status_lbl.setText("Stopped (ready to SAVE) — FX: Off")
+            self.pill.set_state("live")
         self._sync_record_ui()
 
     def update_timecode_label(self):
@@ -1291,16 +1689,19 @@ class SinglePanel(QWidget):
                 b.setChecked(False)
                 b.blockSignals(False)
 
+            # set FX button if present
             if fx and fx in self.fx_buttons:
                 self.fx_buttons[fx].blockSignals(True)
                 self.fx_buttons[fx].setChecked(True)
                 self.fx_buttons[fx].blockSignals(False)
                 self._active_fx_btn = self.fx_buttons[fx]
                 self.state.fx = fx
+                self.top_fx_lbl.setText(f"FX: {fx}")
                 self.status_lbl.setText(f"Loaded preset — FX: {fx}")
             else:
                 self._active_fx_btn = None
                 self.state.fx = ""
+                self.top_fx_lbl.setText("FX: Off")
                 self.status_lbl.setText("Loaded preset — FX: Off")
 
             self.s_dim.setValue(int(st.get("intensity", 80)))
@@ -1323,12 +1724,21 @@ class SinglePanel(QWidget):
             self._rec_elapsed_sec = float(data.get("duration_sec", 0.0) or 0.0)
             self._sync_record_ui()
 
+            if (self.state.fx or "").lower() == "blackout":
+                self.pill.set_state("blackout")
+            else:
+                self.pill.set_state("live")
+
         except Exception as e:
             QMessageBox.critical(self, "Preset Load Error", str(e))
 
     # ---------- Audio UI hooks ----------
     def set_loaded_file(self, path: str):
         self.wav_lbl.setText(f"WAV: {path}")
+
+    def set_audio_running(self, is_running: bool):
+        self.audio_dot.set_on(is_running, "#77C48A" if is_running else "#2A3038")
+        self.audio_lbl.setText("Audio: playing" if is_running else "Audio: idle")
 
     def update_visualizer(self, feat: AudioFeatures):
         self.visualizer.update_from_spectrum(feat.spectrum)
@@ -1337,17 +1747,30 @@ class SinglePanel(QWidget):
         else:
             self.bpm_lbl.setText("BPM: --")
 
+    def update_audio_progress(self, pos_sec: float, total_sec: float):
+        def fmt(t: float) -> str:
+            t = max(0.0, float(t))
+            mm = int(t // 60)
+            ss = int(t % 60)
+            return f"{mm:02d}:{ss:02d}"
+
+        self.pos_lbl.setText(f"{fmt(pos_sec)} / {fmt(total_sec)}")
+        if total_sec > 0:
+            v = int(np.clip((pos_sec / total_sec) * 1000.0, 0, 1000))
+            self.progress_bar.setValue(v)
+
 
 # ----------------------------- Main Window -----------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lighting FX + Audio Visualizer + Simulation (Single Panel)")
-        self.resize(1400, 820)
+        self.setWindowTitle("Lighting FX + Audio Visualizer + Simulation (Single Panel) — UI Upgraded")
+        self.resize(1460, 860)
 
         self.ui = SinglePanel()
         self.setCentralWidget(self.ui)
 
+        # Output engine
         self.output = OutputEngine()
         self.output_cfg = OutputConfig(enabled=False)
         self.output.apply_config(self.output_cfg)
@@ -1357,18 +1780,28 @@ class MainWindow(QMainWindow):
         self.output_timer.timeout.connect(self.output.tick)
         self.output_timer.start()
 
+        # Audio worker thread
         self.file_thread = QThread(self)
         self.file_worker = AudioFileWorker()
         self.file_worker.moveToThread(self.file_thread)
         self.file_thread.start()
 
+        # Start worker analysis timer inside its thread
+        QTimer.singleShot(0, self.file_worker.start_analysis_timer)
+
         self.file_worker.features.connect(self._on_audio_features)
+        self.file_worker.progress.connect(self.ui.update_audio_progress)
         self.file_worker.error.connect(self._on_audio_error)
+        self.file_worker.running.connect(self.ui.set_audio_running)
 
         self.ui.import_clicked.connect(self._import_wav)
         self.ui.play_clicked.connect(self._play)
         self.ui.stop_clicked.connect(self._stop)
         self.ui.replay_clicked.connect(self._replay)
+
+        # Apply DMX config only on changes (not every frame)
+        self.ui.dmx_enable.toggled.connect(self._apply_output_config)
+        self.ui.dmx_config_changed.connect(self._apply_output_config)
 
         self.fx = FxEngine()
         self._latest_feat = AudioFeatures()
@@ -1380,6 +1813,41 @@ class MainWindow(QMainWindow):
         self.frame_timer.start()
 
         self._wav_path: Optional[str] = None
+        self._audio_is_running = False
+
+        self._setup_shortcuts()
+        self._apply_output_config()
+
+    def _setup_shortcuts(self):
+        # Space: toggle play/stop
+        QShortcut(QKeySequence("Space"), self, activated=self._toggle_play_stop)
+        QShortcut(QKeySequence("R"), self, activated=self.ui._record_start)
+        QShortcut(QKeySequence("S"), self, activated=self.ui._record_stop)
+        QShortcut(QKeySequence("B"), self, activated=self.ui._toggle_blackout)
+
+        # FX shortcuts 1..8 (match fx_order in UI)
+        fx_keys = [
+            ("1", "Lightning"),
+            ("2", "Rainbow"),
+            ("3", "Chase"),
+            ("4", "Blackout"),
+            ("5", "Wave"),
+            ("6", "Pulse"),
+            ("7", "Flash"),
+            ("8", "Strobe"),
+        ]
+        for key, fxname in fx_keys:
+            QShortcut(QKeySequence(key), self, activated=lambda name=fxname: self._shortcut_fx(name))
+
+    def _shortcut_fx(self, fxname: str):
+        if fxname in self.ui.fx_buttons:
+            self.ui.fx_buttons[fxname].click()
+
+    def _toggle_play_stop(self):
+        if self._audio_is_running:
+            self._stop()
+        else:
+            self._play()
 
     def closeEvent(self, event):
         try:
@@ -1397,12 +1865,46 @@ class MainWindow(QMainWindow):
             pass
         super().closeEvent(event)
 
+    def _apply_output_config(self):
+        enabled = bool(self.ui.dmx_enable.isChecked())
+        proto = str(self.ui.dmx_proto.currentText()).strip().lower()
+        ip = self.ui.dmx_ip.text().strip() or "255.255.255.255"
+        univ = int(self.ui.dmx_univ.value())
+        sacn_univ = int(self.ui.dmx_sacn_univ.value())
+        start_addr = int(self.ui.dmx_start.value())
+        fps = int(self.ui.dmx_fps.value())
+
+        # reflect DMX dot state
+        if enabled:
+            self.ui.dmx_dot.set_on(True, "#74A6D9" if HAS_DMX else "#D9B574")
+            self.ui.dmx_lbl.setText("DMX: on" if HAS_DMX else "DMX: stub")
+        else:
+            self.ui.dmx_dot.set_on(False)
+            self.ui.dmx_lbl.setText("DMX: off")
+
+        cfg = OutputConfig(
+            enabled=enabled,
+            protocol=proto if enabled else "off",
+            target_ip=ip,
+            universe=univ,
+            sacn_universe=sacn_univ,
+            start_address=start_addr,
+            fps=fps,
+            blackout=False,
+        )
+        self.output_cfg = cfg
+        try:
+            self.output.apply_config(cfg)
+        except Exception:
+            pass
+
     def _import_wav(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import WAV", os.getcwd(), "WAV Files (*.wav)")
         if not path:
             return
         self._wav_path = path
         self.ui.set_loaded_file(path)
+        self.ui.status_lbl.setText("WAV loaded")
         QTimer.singleShot(0, lambda: self.file_worker.load_wav(path))
 
     def _play(self):
@@ -1410,10 +1912,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No WAV", "Click IMPORT first.")
             return
         self.ui.status_lbl.setText("Playing audio")
+        self.ui.audio_lbl.setText("Audio: starting…")
+        self._audio_is_running = True
         QTimer.singleShot(0, self.file_worker.play)
 
     def _stop(self):
-        self.ui.status_lbl.setText("Stopped")
+        self.ui.status_lbl.setText("Stopped audio")
+        self._audio_is_running = False
         QTimer.singleShot(0, self.file_worker.stop)
 
     def _replay(self):
@@ -1421,6 +1926,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No WAV", "Click IMPORT first.")
             return
         self.ui.status_lbl.setText("Replay audio")
+        self._audio_is_running = True
         QTimer.singleShot(0, self.file_worker.replay)
 
     def _on_audio_features(self, feat_obj):
@@ -1440,7 +1946,17 @@ class MainWindow(QMainWindow):
 
         intensity, r, g, b, st_on, pan_out, tilt_out = self.fx.tick(self.ui.state, self._latest_feat, dt, now)
         fx_name = self.ui.state.fx if self.ui.state.fx else "Off"
-        self.ui.sim.set_state(intensity, r, g, b, st_on, fx_name, pan_out, tilt_out)
+
+        # Effective readouts for move auto
+        if self.ui.state.auto_move:
+            self.ui.ro_pan_eff.setText(f"→ {pan_out}")
+            self.ui.ro_tilt_eff.setText(f"→ {tilt_out}")
+        else:
+            self.ui.ro_pan_eff.setText("")
+            self.ui.ro_tilt_eff.setText("")
+
+        legend = f"Dim {intensity}% | RGB {r},{g},{b} | Strobe {'ON' if st_on else 'OFF'} | AutoAudio {'ON' if self.ui.state.auto_audio else 'OFF'} | AutoMove {'ON' if self.ui.state.auto_move else 'OFF'}"
+        self.ui.sim.set_state(intensity, r, g, b, st_on, fx_name, pan_out, tilt_out, legend=legend)
 
         # DMX mapping: [Dimmer, R, G, B, Strobe, Pan, Tilt] (0..100)
         if self.ui.dmx_enable.isChecked():
@@ -1455,10 +1971,8 @@ class MainWindow(QMainWindow):
             if not st_on and self.ui.state.strobe_rate > 0:
                 dim = 0
 
-            self.output.apply_config(OutputConfig(enabled=True))
+            # Only send channel values per-frame; config is applied on change
             self.output.set_channels_from_faders([dim, fr, fg, fb, fst, fpan, ftilt])
-        else:
-            self.output.apply_config(OutputConfig(enabled=False))
 
 
 # ----------------------------- Entrypoint -----------------------------
