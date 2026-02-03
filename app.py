@@ -1,14 +1,17 @@
-# app.py
 """
 Single-Panel Lighting + Audio Controller (DJ / Club UI)
 
-This version is set up for **Option 1: QLC+ bridge via Art-Net** (Windows).
+Art-Net -> QLC+ -> USB DMX (Windows)
 
 ✅ Your Python app sends Art-Net to 127.0.0.1, universe 0
 ✅ QLC+ receives it on Art-Net input, then outputs to your USB DMX dongle
 
-Install:
+Install (base):
   python -m pip install PyQt6 numpy sounddevice soundfile
+
+Optional (MP3 / M4A / AAC / etc via FFmpeg):
+  python -m pip install pydub
+  - Install FFmpeg and make sure "ffmpeg" is in your PATH.
 """
 
 from __future__ import annotations
@@ -22,6 +25,14 @@ from typing import Optional, List, Dict, Tuple
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+
+# Optional decoder for mp3/m4a/aac/etc
+try:
+    from pydub import AudioSegment  # type: ignore
+    HAS_PYDUB = True
+except Exception:
+    AudioSegment = None
+    HAS_PYDUB = False
 
 # -------- Optional DMX (fallback stub if missing) --------
 try:
@@ -45,7 +56,6 @@ except Exception:
     class OutputEngine:
         def __init__(self):
             self._cfg = OutputConfig()
-            self._last = [0] * 512
 
         def apply_config(self, cfg: OutputConfig):
             self._cfg = cfg
@@ -69,8 +79,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QToolButton,
         QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QSizePolicy, QButtonGroup,
-        QSlider, QLineEdit, QMessageBox, QFileDialog, QAbstractButton, QColorDialog,
-        QBoxLayout
+        QSlider, QLineEdit, QMessageBox, QFileDialog, QAbstractButton, QBoxLayout
     )
     QT6 = True
 except Exception:
@@ -81,8 +90,7 @@ except Exception:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QToolButton,
         QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QSizePolicy, QButtonGroup,
-        QSlider, QLineEdit, QMessageBox, QFileDialog, QAbstractButton, QColorDialog,
-        QBoxLayout
+        QSlider, QLineEdit, QMessageBox, QFileDialog, QAbstractButton, QBoxLayout
     )
     QT6 = False
 
@@ -93,6 +101,74 @@ def _box_dir_left_to_right():
 
 def _box_dir_top_to_bottom():
     return QBoxLayout.Direction.TopToBottom if QT6 else QBoxLayout.TopToBottom
+
+
+# ----------------------------- Discrete Color Wheel (CH8) -----------------------------
+COLOR_SLOTS = [
+    ("WHITE",   0,   9,  (255, 255, 255)),
+    ("RED",    10,  19,  (255,   0,   0)),
+    ("GREEN",  20,  29,  (  0, 255,   0)),
+    ("BLUE",   30,  39,  (  0,   0, 255)),
+    ("YELLOW", 40,  49,  (255, 255,   0)),
+    ("ORANGE", 50,  59,  (255, 140,   0)),
+    ("PURPLE", 60,  69,  (160,   0, 255)),
+    ("BROWN",  70,  79,  (120,  70,  20)),
+    ("ROSE",   80,  89,  (255,   0,  90)),
+    ("WARM",   90,  99,  (255, 180, 120)),
+    ("L-GREEN",100, 109, (120, 255, 120)),
+    ("L-BLUE", 110, 119, (120, 180, 255)),
+]
+
+
+def color_slot_to_dmx(slot: int) -> int:
+    slot = int(np.clip(slot, 0, len(COLOR_SLOTS) - 1))
+    _, lo, hi, _ = COLOR_SLOTS[slot]
+    return int((lo + hi) // 2)
+
+
+def color_slot_to_rgb(slot: int) -> Tuple[int, int, int]:
+    slot = int(np.clip(slot, 0, len(COLOR_SLOTS) - 1))
+    return COLOR_SLOTS[slot][3]
+
+
+# ----------------------------- Pattern / Gobo (CH9) -----------------------------
+PATTERN_RANGES: List[Tuple[str, int, int]] = [
+    ("P1", 0, 5),
+    ("P2", 6, 11),
+    ("P3", 12, 17),
+    ("P4", 18, 23),
+    ("P5", 90, 95),
+    ("P6", 96, 101),
+    ("P7", 102, 107),
+    ("P8", 108, 113),
+]
+
+
+def pattern_idx_to_dmx(pattern_idx: Optional[int]) -> int:
+    if pattern_idx is None:
+        return 0
+    pattern_idx = int(pattern_idx)
+    if pattern_idx < 0 or pattern_idx >= len(PATTERN_RANGES):
+        return 0
+    _name, lo, hi = PATTERN_RANGES[pattern_idx]
+    return int((lo + hi) // 2)
+
+
+# ----------------------------- Recommended 8 Presets -----------------------------
+FX_PRESETS = [
+    "CLEAN CLUB WASH",
+    "BUILD DROP",
+    "TECHNO WAREHOUSE",
+    "FESTIVAL HANDS-UP",
+    "WARM LOUNGE",
+    "RB GROOVE",
+    "DNB HARD DROP",
+    "LIGHTNING STORM",
+]
+
+
+def _fx_key(name: str) -> str:
+    return (name or "").strip().lower()
 
 
 # ----------------------------- Styling -----------------------------
@@ -126,6 +202,12 @@ QToolButton:hover, QPushButton:hover { border-color: #3C4452; }
 QToolButton:checked {
     background: #2D3642;
     border-color: #5B89B8;
+}
+
+/* Smaller buttons for FX + Pattern panels */
+QToolButton#FxBtn, QToolButton#PatBtn {
+    padding: 6px 10px;
+    border-radius: 10px;
 }
 
 QPushButton#Primary { border-color: #5B89B8; }
@@ -179,15 +261,6 @@ QSlider::handle:horizontal {
     margin: -6px 0;
     border-radius: 9px;
 }
-
-/* Color button */
-QPushButton#ColorSwatch {
-    border-radius: 12px;
-    border: 1px solid #323844;
-    padding: 12px;
-    text-align: left;
-}
-QPushButton#ColorSwatch:hover { border-color: #3C4452; }
 """
 
 
@@ -416,14 +489,56 @@ class SimpleVisualizer(QFrame):
         for i in range(nb):
             lvl = float(self._levels[i])
             bh = int(max_h * lvl)
-            x = r.left() + i * (bar_w + gap)
-            y = r.bottom() - bh
-            p.fillRect(QRect(x, y, bar_w, bh), QColor(91, 137, 184, 200))
+            x0 = r.left() + i * (bar_w + gap)
+            y0 = r.bottom() - bh
+            p.fillRect(QRect(x0, y0, bar_w, bh), QColor(91, 137, 184, 200))
 
         p.end()
 
 
-# ----------------------------- Audio WAV Worker -----------------------------
+# ----------------------------- Audio decode helper -----------------------------
+def load_audio_any(path: str) -> Tuple[np.ndarray, int]:
+    """
+    Returns (audio_float32_2d, sample_rate).
+    audio shape: (nframes, nchannels), float32 in [-1, 1]
+    """
+    # 1) Try soundfile first (WAV/FLAC/OGG/AIFF etc depending on libsndfile build)
+    try:
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        if data.size == 0:
+            raise ValueError("Empty file")
+        return data, int(sr)
+    except Exception as e_sf:
+        # 2) Fallback: pydub + ffmpeg for mp3/m4a/aac/etc
+        if not HAS_PYDUB:
+            raise RuntimeError(
+                f"Couldn't read audio with soundfile ({e_sf}). "
+                f"To load MP3/M4A/etc install: pip install pydub, and install FFmpeg."
+            )
+
+        try:
+            seg = AudioSegment.from_file(path)  # requires ffmpeg for most formats
+            sr = int(seg.frame_rate)
+            ch = int(seg.channels)
+            sw = int(seg.sample_width)  # bytes per sample
+
+            raw = np.array(seg.get_array_of_samples(), dtype=np.int32)  # interleaved
+            if ch > 1:
+                raw = raw.reshape((-1, ch))
+            else:
+                raw = raw.reshape((-1, 1))
+
+            # normalize signed PCM
+            max_val = float(2 ** (8 * sw - 1))
+            data = (raw.astype(np.float32) / max_val).clip(-1.0, 1.0)
+            if data.size == 0:
+                raise ValueError("Empty file")
+            return data, sr
+        except Exception as e_pd:
+            raise RuntimeError(f"Failed to load audio via FFmpeg/PyDub: {e_pd}")
+
+
+# ----------------------------- Audio WAV/Any Worker -----------------------------
 class AudioFileWorker(QObject):
     features = pyqtSignal(object)
     position = pyqtSignal(float, float)  # current_sec, total_sec
@@ -450,22 +565,30 @@ class AudioFileWorker(QObject):
         self._bpm_ema: float = 0.0
         self._bpm_alpha: float = 0.15
 
-    def load_wav(self, path: str):
+    def load_audio(self, path: str):
         try:
-            data, sr = sf.read(path, dtype="float32", always_2d=True)
+            data, sr = load_audio_any(path)
+
+            # ensure float32 2d
+            if data.ndim != 2:
+                data = np.atleast_2d(data).astype(np.float32)
+            data = data.astype(np.float32, copy=False)
+
             if data.size == 0:
                 raise ValueError("Empty file")
+
             self._audio = data
             self._sr = int(sr)
             with self._idx_lock:
                 self._idx = 0
                 self._total_frames = int(self._audio.shape[0])
+
             self._prev_rms = 0.0
             self._onset_times.clear()
             self._bpm_ema = 0.0
             self.position.emit(0.0, self.total_seconds())
         except Exception as e:
-            self.error.emit(f"Failed to load WAV: {e}")
+            self.error.emit(f"Failed to load audio: {e}")
 
     def total_seconds(self) -> float:
         if self._sr <= 0 or self._total_frames <= 0:
@@ -492,7 +615,7 @@ class AudioFileWorker(QObject):
 
     def play(self):
         if self._audio is None:
-            self.error.emit("No WAV loaded. Click Import first.")
+            self.error.emit("No audio loaded. Click Import first.")
             return
 
         if self._stream is not None:
@@ -540,7 +663,7 @@ class AudioFileWorker(QObject):
             self.running.emit(True)
         except Exception as e:
             self._stream = None
-            self.error.emit(f"Failed to start WAV playback: {e}")
+            self.error.emit(f"Failed to start playback: {e}")
 
     def stop(self):
         self._stop_flag = True
@@ -604,53 +727,32 @@ class AudioFileWorker(QObject):
             self.position.emit(self.current_seconds(), self.total_seconds())
 
 
-# ----------------------------- Lighting / FX -----------------------------
+# ----------------------------- Lighting State / FX Engine -----------------------------
 @dataclass
 class ControlState:
     fx: str = ""
     auto_audio: bool = False
     auto_move: bool = False
     intensity: int = 80
-    r: int = 0
-    g: int = 120
-    b: int = 255
-    strobe_rate: int = 0
-    pan: int = 270
-    tilt: int = 90
+
+    color_slot: int = 11
+    manual_blackout: bool = False
+
+    pattern_idx: Optional[int] = None
+
+    flashing: int = 0  # 0..15 off, 16..255 slow..fast
+
+    pan: int = 128     # DMX CH1 0..255
+    tilt: int = 90     # UI 0..180 (mapped to CH3 0..255)
+
     preset_name: str = "Untitled"
-
-
-def hsv_to_rgb(h: float, s: float, v: float) -> Tuple[int, int, int]:
-    h = float(h % 1.0)
-    s = float(np.clip(s, 0.0, 1.0))
-    v = float(np.clip(v, 0.0, 1.0))
-    i = int(h * 6.0)
-    f = h * 6.0 - i
-    p = v * (1.0 - s)
-    q = v * (1.0 - f * s)
-    t = v * (1.0 - (1.0 - f) * s)
-    i = i % 6
-    if i == 0:
-        r, g, b = v, t, p
-    elif i == 1:
-        r, g, b = q, v, p
-    elif i == 2:
-        r, g, b = p, v, t
-    elif i == 3:
-        r, g, b = p, q, v
-    elif i == 4:
-        r, g, b = t, p, v
-    else:
-        r, g, b = v, p, q
-    return int(r * 255), int(g * 255), int(b * 255)
+    ch_on: Tuple[bool, bool, bool, bool] = (False, False, False, False)
 
 
 class FxEngine:
     def __init__(self):
-        self._flash_until = 0.0
+        self._phase = 0.0
         self._lightning_until = 0.0
-        self._strobe_phase = 0.0
-        self._chase_phase = 0.0
         self._move_pan = 0.0
         self._move_tilt = 0.0
         self._move_pan_rate = 0.35
@@ -658,105 +760,86 @@ class FxEngine:
         self._pan_bias = 0.0
         self._tilt_bias = 0.0
 
-    def tick(self, state: ControlState, feat: AudioFeatures, dt: float, t: float):
-        intensity = int(np.clip(state.intensity, 0, 100))
-        r, g, b = int(state.r), int(state.g), int(state.b)
+    @staticmethod
+    def flashing_value_to_hz(v: int) -> float:
+        v = int(np.clip(v, 0, 255))
+        if v <= 15:
+            return 0.0
+        t01 = (v - 16) / float(255 - 16)
+        return float(1.0 + t01 * (20.0 - 1.0))  # 1Hz..20Hz
 
-        pan_out = int(np.clip(state.pan, 0, 540))
+    def tick(self, state: ControlState, feat: AudioFeatures, dt: float, t: float) -> Tuple[int, bool, int, int]:
+        intensity = int(np.clip(state.intensity, 0, 100))
+        pan_out = int(np.clip(state.pan, 0, 255))
         tilt_out = int(np.clip(state.tilt, 0, 180))
 
         if state.auto_audio:
             level = float(np.clip((feat.rms or 0.0) * 6.0, 0.0, 1.0))
             intensity = int(np.clip(0.25 * intensity + 0.75 * (level * 100.0), 0, 100))
 
-            bass = float(feat.bass or 0.0)
-            mid = float(feat.mid or 0.0)
-            tre = float(feat.treble or 0.0)
-            ssum = bass + mid + tre + 1e-6
-
-            rr = tre / ssum
-            gg = mid / ssum
-            bb = bass / ssum
-
-            r = int(np.clip(0.45 * r + 0.55 * (rr * 255.0), 0, 255))
-            g = int(np.clip(0.45 * g + 0.55 * (gg * 255.0), 0, 255))
-            b = int(np.clip(0.45 * b + 0.55 * (bb * 255.0), 0, 255))
-
         if state.auto_move:
             bpm = float(getattr(feat, "bpm", 0.0) or 0.0)
             speed = float(np.clip((bpm / 120.0) if bpm > 0.0 else 0.65, 0.35, 2.0))
 
-            self._pan_bias += (np.sin(t * 0.11) + np.sin(t * 0.07 + 1.7)) * dt * 6.0
+            self._pan_bias += (np.sin(t * 0.11) + np.sin(t * 0.07 + 1.7)) * dt * 2.0
             self._tilt_bias += (np.sin(t * 0.09 + 0.4) + np.sin(t * 0.06 + 2.1)) * dt * 3.5
-            self._pan_bias = float(np.clip(self._pan_bias, -60.0, 60.0))
+            self._pan_bias = float(np.clip(self._pan_bias, -25.0, 25.0))
             self._tilt_bias = float(np.clip(self._tilt_bias, -25.0, 25.0))
 
             self._move_pan += dt * self._move_pan_rate * speed
             self._move_tilt += dt * self._move_tilt_rate * speed
 
-            amp_pan = 180.0
+            amp_pan = 90.0
             amp_tilt = 55.0
 
             pan_center = float(state.pan)
             tilt_center = float(state.tilt)
 
-            pan_out = int(np.clip(pan_center + np.sin(self._move_pan * 2.0 * np.pi) * amp_pan + self._pan_bias, 0, 540))
+            pan_out = int(np.clip(pan_center + np.sin(self._move_pan * 2.0 * np.pi) * amp_pan + self._pan_bias, 0, 255))
             tilt_out = int(np.clip(tilt_center + np.sin(self._move_tilt * 2.0 * np.pi + 0.8) * amp_tilt + self._tilt_bias, 0, 180))
 
-        fx = (state.fx or "").strip().lower()
-        strobe_on = True
+        fx = _fx_key(state.fx)
+        st_on = True
 
         bpm = float(getattr(feat, "bpm", 0.0) or 0.0)
         beat_hz = (bpm / 60.0) if bpm > 0.0 else 1.6
 
-        if fx == "blackout":
-            intensity = 0
-        elif fx == "rainbow":
-            hue = (t * 0.08) % 1.0
-            r, g, b = hsv_to_rgb(hue, 1.0, 1.0)
-        elif fx == "wave":
-            hue = (t * 0.06 + (pan_out / 540.0) * 0.2) % 1.0
-            r, g, b = hsv_to_rgb(hue, 0.9, 1.0)
-            wave = 0.55 + 0.45 * (0.5 + 0.5 * np.sin(2.0 * np.pi * 0.5 * t))
+        if fx == "clean club wash":
+            wave = 0.70 + 0.30 * (0.5 + 0.5 * np.sin(2.0 * np.pi * 0.25 * t))
             intensity = int(np.clip(intensity * wave, 0, 100))
-        elif fx == "pulse":
-            pulse = 0.30 + 0.70 * (0.5 + 0.5 * np.sin(2.0 * np.pi * beat_hz * t))
+        elif fx == "build drop":
+            pulse = 0.35 + 0.65 * (0.5 + 0.5 * np.sin(2.0 * np.pi * beat_hz * t))
             intensity = int(np.clip(intensity * pulse, 0, 100))
-        elif fx == "flash":
-            if (feat.peak or 0.0) > 0.02 or (bpm > 0.0 and (np.sin(2.0 * np.pi * beat_hz * t) > 0.98)):
-                self._flash_until = max(self._flash_until, t + 0.12)
-            if t < self._flash_until:
-                intensity = 100
-                r, g, b = 255, 255, 255
-        elif fx == "lightning":
+        elif fx == "techno warehouse":
+            pulse = 0.20 + 0.80 * (0.5 + 0.5 * np.sin(2.0 * np.pi * beat_hz * t))
+            intensity = int(np.clip(intensity * pulse, 0, 100))
+        elif fx == "festival hands-up":
+            intensity = int(np.clip(intensity * 0.95, 0, 100))
+        elif fx == "warm lounge":
+            wave = 0.75 + 0.25 * (0.5 + 0.5 * np.sin(2.0 * np.pi * 0.18 * t))
+            intensity = int(np.clip(intensity * wave, 0, 100))
+        elif fx == "rb groove":
+            pulse = 0.55 + 0.45 * (0.5 + 0.5 * np.sin(2.0 * np.pi * (beat_hz * 0.85) * t))
+            intensity = int(np.clip(intensity * pulse, 0, 100))
+        elif fx == "dnb hard drop":
+            pulse = 0.15 + 0.85 * (0.5 + 0.5 * np.sin(2.0 * np.pi * (beat_hz * 1.3) * t))
+            intensity = int(np.clip(intensity * pulse, 0, 100))
+        elif fx == "lightning storm":
             if t > self._lightning_until and np.random.rand() < (dt * 0.9):
                 self._lightning_until = t + float(np.random.uniform(0.18, 0.55))
             if t < self._lightning_until:
                 intensity = 100
-                r, g, b = 255, 255, 255
-                strobe_on = ((int(t * 26.0) % 2) == 0) and (np.random.rand() > 0.15)
-        elif fx == "chase":
-            self._chase_phase += dt * (beat_hz * 2.0)
-            step = int(self._chase_phase) % 4
-            chase_colors = [(255, 80, 60), (60, 255, 120), (80, 140, 255), (255, 255, 255)]
-            r, g, b = chase_colors[step]
-            intensity = int(np.clip(intensity * 0.95, 0, 100))
-        elif fx == "strobe":
-            rate = int(state.strobe_rate) if state.strobe_rate > 0 else 12
-            self._strobe_phase += dt * float(rate)
-            strobe_on = (int(self._strobe_phase) % 2) == 0
+                st_on = ((int(t * 26.0) % 2) == 0) and (np.random.rand() > 0.15)
 
-        if fx != "strobe" and state.strobe_rate > 0:
-            self._strobe_phase += dt * float(state.strobe_rate)
-            strobe_on = (int(self._strobe_phase) % 2) == 0
-
-        if intensity > 0 and (r, g, b) == (0, 0, 0):
-            r, g, b = 255, 255, 255
+        hz = self.flashing_value_to_hz(int(state.flashing))
+        if hz > 0.0:
+            self._phase += dt * hz
+            st_on = (int(self._phase) % 2) == 0
 
         if intensity <= 0:
-            return 0, 0, 0, 0, False, pan_out, tilt_out
+            return 0, False, pan_out, tilt_out
 
-        return intensity, r, g, b, bool(strobe_on), pan_out, tilt_out
+        return intensity, bool(st_on), pan_out, tilt_out
 
 
 # ----------------------------- Simulation -----------------------------
@@ -767,23 +850,41 @@ class SimulationWidget(QFrame):
         self._base_min_h = 360
         self.setMinimumHeight(self._base_min_h)
 
+        self._mode = "moving"  # "moving" | "four"
+
         self._intensity = 0
-        self._rgb = (0, 120, 255)
-        self._strobe_on = True
+        self._rgb = (255, 255, 255)
+        self._st_on = True
         self._fx_name = "Off"
-        self._pan = 270
-        self._tilt = 90
+        self._pan = 128  # 0..255
+        self._tilt = 90  # 0..180
+
+        self._four_levels = [0, 0, 0, 0]
+        self._four_rgb = (255, 255, 255)
+        self._four_st_on = True
 
     def apply_scale(self, s: float):
         self.setMinimumHeight(int(max(220, round(self._base_min_h * s))))
 
-    def set_state(self, intensity_0_100: int, r: int, g: int, b: int, strobe_on: bool, fx_name: str, pan: int, tilt: int):
+    def set_state(self, intensity_0_100: int, rgb: Tuple[int, int, int], st_on: bool, fx_name: str, pan: int, tilt: int):
+        self._mode = "moving"
         self._intensity = int(np.clip(intensity_0_100, 0, 100))
-        self._rgb = (int(np.clip(r, 0, 255)), int(np.clip(g, 0, 255)), int(np.clip(b, 0, 255)))
-        self._strobe_on = bool(strobe_on)
+        rr, gg, bb = rgb
+        self._rgb = (int(np.clip(rr, 0, 255)), int(np.clip(gg, 0, 255)), int(np.clip(bb, 0, 255)))
+        self._st_on = bool(st_on)
         self._fx_name = (fx_name or "Off")
-        self._pan = int(np.clip(pan, 0, 540))
+        self._pan = int(np.clip(pan, 0, 255))
         self._tilt = int(np.clip(tilt, 0, 180))
+        self.update()
+
+    def set_four_lights(self, levels_0_100: List[int], rgb: Tuple[int, int, int], st_on: bool, fx_name: str):
+        self._mode = "four"
+        padded = (levels_0_100[:4] + [0, 0, 0, 0])[:4]
+        self._four_levels = [int(np.clip(v, 0, 100)) for v in padded]
+        rr, gg, bb = rgb
+        self._four_rgb = (int(np.clip(rr, 0, 255)), int(np.clip(gg, 0, 255)), int(np.clip(bb, 0, 255)))
+        self._four_st_on = bool(st_on)
+        self._fx_name = (fx_name or "Off")
         self.update()
 
     def paintEvent(self, event):
@@ -793,19 +894,51 @@ class SimulationWidget(QFrame):
 
         R = self.rect().adjusted(14, 14, -14, -14)
         p.fillRect(R, QColor(10, 12, 16, 230))
+        inner = R.adjusted(8, 32, -8, -10)
+
+        if self._mode == "four":
+            p.setPen(QPen(QColor(214, 217, 222, 180), 1))
+            p.drawText(R.left() + 10, R.top() + 22, f"Simulation — 4 Lights (CH1–4) — FX: {self._fx_name}")
+
+            r0, g0, b0 = self._four_rgb
+            spacing = inner.width() / 4.0
+            cy = inner.center().y()
+            radius = float(np.clip(inner.height() * 0.22, 28.0, 95.0))
+
+            p.setPen(Qt.PenStyle.NoPen if QT6 else Qt.NoPen)
+            for i in range(4):
+                level = self._four_levels[i]
+                alpha = 0 if (level <= 0) or (not self._four_st_on) else int(np.clip(220 * (level / 100.0), 0, 240))
+                cx = inner.left() + spacing * (i + 0.5)
+
+                p.setBrush(QColor(60, 70, 82, 220))
+                p.drawEllipse(QRect(int(cx - 9), int(cy + radius + 10), 18, 18))
+
+                rg = QRadialGradient(QPointF(cx, cy), radius)
+                rg.setColorAt(0.0, QColor(r0, g0, b0, alpha))
+                rg.setColorAt(0.6, QColor(r0, g0, b0, int(alpha * 0.35)))
+                rg.setColorAt(1.0, QColor(r0, g0, b0, 0))
+                p.setBrush(QBrush(rg))
+                p.drawEllipse(QRect(int(cx - radius), int(cy - radius), int(radius * 2), int(radius * 2)))
+
+                p.setPen(QPen(QColor(170, 178, 188, 200), 1))
+                p.drawText(int(cx - 18), int(cy - radius - 10), f"CH{i+1}")
+                p.setPen(Qt.PenStyle.NoPen if QT6 else Qt.NoPen)
+
+            p.end()
+            return
 
         p.setPen(QPen(QColor(214, 217, 222, 180), 1))
         p.drawText(
             R.left() + 10,
             R.top() + 22,
-            f"Simulation — FX: {self._fx_name}   |   Pan: {self._pan}°   Tilt: {self._tilt}°"
+            f"Simulation — FX: {self._fx_name}   |   Pan(CH1): {self._pan}   Tilt: {self._tilt}°"
         )
 
-        inner = R.adjusted(8, 32, -8, -10)
         fx_x = inner.center().x()
         fx_y = inner.bottom()
 
-        pan_norm = (self._pan % 540) / 540.0
+        pan_norm = float(np.clip(self._pan / 255.0, 0.0, 1.0))
         tx = inner.left() + pan_norm * inner.width()
 
         tilt_norm = float(np.clip(self._tilt / 180.0, 0.0, 1.0))
@@ -817,7 +950,7 @@ class SimulationWidget(QFrame):
         p.setBrush(QColor(70, 78, 90, 220))
         p.drawEllipse(QRect(int(fx_x - 7), int(fx_y - 9), 14, 14))
 
-        if self._intensity <= 0 or not self._strobe_on:
+        if self._intensity <= 0 or not self._st_on:
             p.end()
             return
 
@@ -876,10 +1009,11 @@ class SinglePanel(QWidget):
         self.state = ControlState()
 
         self._user_scrubbing = False
-        self._syncing_color = False
-
         self._base_w = 1366
         self._base_h = 768
+
+        self._selected_color_idx: Optional[int] = int(self.state.color_slot)
+        self._selected_pattern_idx: Optional[int] = None
 
         root = QHBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -889,69 +1023,29 @@ class SinglePanel(QWidget):
         self.split.setChildrenCollapsible(False)
         root.addWidget(self.split, 1)
 
-        # Left
-        self.left = QWidget()
-        self.left_lay = QVBoxLayout(self.left)
-        self.left_lay.setContentsMargins(0, 0, 0, 0)
-        self.left_lay.setSpacing(10)
+        
 
-        self.top_panel = Panel("Show Controls")
-        self.left_lay.addWidget(self.top_panel, 0)
+        # FX + Pattern row
+        self.fx_pat_row = QHBoxLayout()
+        self.fx_pat_row.setSpacing(10)
 
-        status_row = QHBoxLayout()
-        self.time_lbl = QLabel("00:00")
-        self.time_lbl.setFont(QFont("Segoe UI", 14, 800))
-        self.time_lbl.setObjectName("PanelTitle")
-        self.status_lbl = QLabel("Stopped")
-        self.status_lbl.setObjectName("Subtle")
-        status_row.addWidget(self.time_lbl)
-        status_row.addSpacing(10)
-        status_row.addWidget(self.status_lbl)
-        status_row.addStretch(1)
-        self.top_panel.body.addLayout(status_row)
-
-        preset_row = QHBoxLayout()
-        preset_row.setSpacing(10)
-        preset_row.addWidget(QLabel("Preset:"))
-        self.preset_name = QLineEdit(self.state.preset_name)
-        self.preset_name.setPlaceholderText("Preset name (for SAVE/LOAD)")
-        preset_row.addWidget(self.preset_name, 1)
-        self.top_panel.body.addLayout(preset_row)
-
-        rec_row = QHBoxLayout()
-        rec_row.setSpacing(10)
-        self.btn_record = QPushButton("RECORD")
-        self.btn_stoprec = QPushButton("STOP")
-        self.btn_stoprec.setObjectName("Danger")
-        self.btn_save = QPushButton("SAVE")
-        self.btn_load = QPushButton("LOAD")
-        self._all_main_buttons = [self.btn_record, self.btn_stoprec, self.btn_save, self.btn_load]
-        for b in self._all_main_buttons:
-            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        rec_row.addWidget(self.btn_record)
-        rec_row.addWidget(self.btn_stoprec)
-        rec_row.addWidget(self.btn_save)
-        rec_row.addWidget(self.btn_load)
-        self.top_panel.body.addLayout(rec_row)
-
-        # FX
-        self.fx_panel = Panel("Built-in FX (click again to turn off)")
-        self.left_lay.addWidget(self.fx_panel, 0)
+        self.fx_panel = Panel("FX Presets")
+        self.fx_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self.fx_group = QButtonGroup(self)
         self.fx_group.setExclusive(False)
         self._active_fx_btn: Optional[QToolButton] = None
 
         self.fx_grid = QGridLayout()
-        self.fx_grid.setSpacing(10)
+        self.fx_grid.setSpacing(8)
 
         self.fx_buttons: Dict[str, QToolButton] = {}
-        order = ["Lightning", "Rainbow", "Chase", "Blackout", "Wave", "Pulse", "Flash", "Strobe"]
-        for i, name in enumerate(order):
+        for i, name in enumerate(FX_PRESETS):
             btn = QToolButton()
-            btn.setText(name.upper())
+            btn.setObjectName("FxBtn")
+            btn.setText(name)
             btn.setCheckable(True)
-            btn.setMinimumHeight(56)
+            btn.setMinimumHeight(44)
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.fx_group.addButton(btn, i)
             self.fx_buttons[name] = btn
@@ -961,49 +1055,80 @@ class SinglePanel(QWidget):
         for btn in self.fx_buttons.values():
             btn.clicked.connect(lambda checked, b=btn: self._on_fx_clicked(b, checked))
 
+        self.pat_panel = Panel("Gobo / Pattern (CH9) — click again = OFF")
+        self.pat_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self.pat_grid = QGridLayout()
+        self.pat_grid.setSpacing(8)
+        self.pat_btns: List[QToolButton] = []
+
+        for i, (nm, _lo, _hi) in enumerate(PATTERN_RANGES):
+            b = QToolButton()
+            b.setObjectName("PatBtn")
+            b.setText(nm)
+            b.setCheckable(True)
+            b.setMinimumHeight(44)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            b.clicked.connect(lambda checked, idx=i: self._on_pattern_clicked(idx, checked))
+            self.pat_btns.append(b)
+            self.pat_grid.addWidget(b, i // 4, i % 4)
+
+        self.pat_panel.body.addLayout(self.pat_grid)
+
+        self.fx_pat_row.addWidget(self.fx_panel, 1)
+        self.fx_pat_row.addWidget(self.pat_panel, 1)
+
+        fxpat_wrap = QWidget()
+        fxpat_wrap.setLayout(self.fx_pat_row)
+        self.left_lay.addWidget(fxpat_wrap, 0)
+
         # Sliders
         self.slider_panel = Panel("Sliders")
         self.left_lay.addWidget(self.slider_panel, 1)
 
-        self.row_and_picker = QBoxLayout(_box_dir_left_to_right())
-        self.row_and_picker.setContentsMargins(0, 0, 0, 0)
-        self.row_and_picker.setSpacing(12)
+        self.row_and_color = QBoxLayout(_box_dir_left_to_right())
+        self.row_and_color.setContentsMargins(0, 0, 0, 0)
+        self.row_and_color.setSpacing(12)
 
         self.row_box = QWidget()
         self.row = QHBoxLayout(self.row_box)
         self.row.setContentsMargins(0, 0, 0, 0)
         self.row.setSpacing(8)
 
-        self.card_dim = SliderCard("DIMMER", (0, 100), self.state.intensity)
-        self.card_r = SliderCard("RED", (0, 255), self.state.r)
-        self.card_g = SliderCard("GREEN", (0, 255), self.state.g)
-        self.card_b = SliderCard("BLUE", (0, 255), self.state.b)
-        self.card_st = SliderCard("STROBE", (0, 20), self.state.strobe_rate)
-        self.card_pan = SliderCard("PAN", (0, 540), self.state.pan)
+        self.card_dim = SliderCard("DIM", (0, 100), self.state.intensity)
+        self.card_flash = SliderCard("FLASH", (0, 255), self.state.flashing)
+        self.card_pan = SliderCard("PAN", (0, 255), self.state.pan)
         self.card_tilt = SliderCard("TILT", (0, 180), self.state.tilt)
 
-        self.cards = [self.card_dim, self.card_r, self.card_g, self.card_b, self.card_st, self.card_pan, self.card_tilt]
+        self.cards = [self.card_dim, self.card_flash, self.card_pan, self.card_tilt]
         for c in self.cards:
             self.row.addWidget(c)
 
-        self.row_and_picker.addWidget(self.row_box, 0)
+        self.row_and_color.addWidget(self.row_box, 0)
 
-        self.color_panel = Panel("Color")
+        # Color buttons
+        self.color_panel = Panel("Color (CH8) — click same color again = OFF")
         self.color_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.color_swatch = QPushButton()
-        self.color_swatch.setObjectName("ColorSwatch")
-        self.color_swatch.setMinimumHeight(86)
-        self.color_hex = QLabel("#000000")
-        self.color_hex.setObjectName("Subtle")
-        self.color_panel.body.addWidget(QLabel("Pick a color to set RGB sliders:"))
-        self.color_panel.body.addWidget(self.color_swatch)
-        self.color_panel.body.addWidget(self.color_hex)
-        self.color_swatch.clicked.connect(self._pick_color_dialog)
 
-        self.row_and_picker.addWidget(self.color_panel, 0)
+        self.color_btns: List[QToolButton] = []
+        self.color_grid = QGridLayout()
+        self.color_grid.setSpacing(10)
+
+        for i, (name, _lo, _hi, _rgb) in enumerate(COLOR_SLOTS):
+            b = QToolButton()
+            b.setText(name)
+            b.setCheckable(True)
+            b.setMinimumHeight(44)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            b.clicked.connect(lambda checked, idx=i: self._on_color_clicked(idx, checked))
+            self.color_btns.append(b)
+            self.color_grid.addWidget(b, i // 4, i % 4)
+
+        self.color_panel.body.addLayout(self.color_grid)
+        self.row_and_color.addWidget(self.color_panel, 0)
 
         wrap = QWidget()
-        wrap.setLayout(self.row_and_picker)
+        wrap.setLayout(self.row_and_color)
         self.slider_panel.body.addWidget(wrap)
 
         # Switches
@@ -1026,12 +1151,25 @@ class SinglePanel(QWidget):
         self.sw_auto_move, w_move, self.lb_move = add_switch("AUTO PAN/TILT (BPM)")
         self.sw_dmx, w_dmx, self.lb_dmx = add_switch("DMX Output")
 
+        # CH1..CH4 buttons (DMX addresses 1..4)
+        self.btn_ch1 = QToolButton(); self.btn_ch1.setText("CH1"); self.btn_ch1.setCheckable(True)
+        self.btn_ch2 = QToolButton(); self.btn_ch2.setText("CH2"); self.btn_ch2.setCheckable(True)
+        self.btn_ch3 = QToolButton(); self.btn_ch3.setText("CH3"); self.btn_ch3.setCheckable(True)
+        self.btn_ch4 = QToolButton(); self.btn_ch4.setText("CH4"); self.btn_ch4.setCheckable(True)
+        for b in (self.btn_ch1, self.btn_ch2, self.btn_ch3, self.btn_ch4):
+            b.setMinimumHeight(44)
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
         self.switches = [self.sw_auto, self.sw_auto_move, self.sw_dmx]
         self.switch_labels = [self.lb_auto, self.lb_move, self.lb_dmx]
 
         self.switch_row.addWidget(w_auto)
         self.switch_row.addWidget(w_move)
         self.switch_row.addWidget(w_dmx)
+        self.switch_row.addWidget(self.btn_ch1)
+        self.switch_row.addWidget(self.btn_ch2)
+        self.switch_row.addWidget(self.btn_ch3)
+        self.switch_row.addWidget(self.btn_ch4)
         self.switch_row.addStretch(1)
         self.slider_panel.body.addLayout(self.switch_row)
 
@@ -1097,31 +1235,170 @@ class SinglePanel(QWidget):
         audio_row.addWidget(self.btn_import)
         self.audio_panel.body.addLayout(audio_row)
 
-        self.wav_lbl = QLabel("WAV: (none)")
-        self.wav_lbl.setObjectName("Subtle")
-        self.wav_lbl.setWordWrap(True)
-        self.audio_panel.body.addWidget(self.wav_lbl)
+        self.audio_lbl = QLabel("AUDIO: (none)")
+        self.audio_lbl.setObjectName("Subtle")
+        self.audio_lbl.setWordWrap(True)
+        self.audio_panel.body.addWidget(self.audio_lbl)
 
         self.split.addWidget(self.left)
         self.split.addWidget(self.right)
         self.split.setStretchFactor(0, 3)
         self.split.setStretchFactor(1, 2)
 
+        # DMX auto-force behavior (CH buttons act as DMX Output toggle)
+        self._dmx_forced_by_channels = False
+        self.sw_dmx.clicked.connect(self._dmx_manual_override)
+
         # Wiring
-        for s in [c.slider for c in self.cards]:
-            s.valueChanged.connect(self._on_controls_changed)
+        for sld in [c.slider for c in self.cards]:
+            sld.valueChanged.connect(self._on_controls_changed)
+
         self.sw_auto.toggled.connect(self._on_controls_changed)
         self.sw_auto_move.toggled.connect(self._on_controls_changed)
         self.preset_name.textChanged.connect(self._on_controls_changed)
+
+        for b in (self.btn_ch1, self.btn_ch2, self.btn_ch3, self.btn_ch4):
+            b.toggled.connect(self._on_controls_changed)
 
         self.btn_import.clicked.connect(self.import_clicked.emit)
         self.btn_play.clicked.connect(self.play_clicked.emit)
         self.btn_stop.clicked.connect(self.stop_clicked.emit)
         self.btn_replay.clicked.connect(self.replay_clicked.emit)
 
-        self._set_swatch_color(self.card_r.slider.value(), self.card_g.slider.value(), self.card_b.slider.value())
+        # init manual color
+        self._set_manual_color_checked(int(self.state.color_slot))
+        self.state.manual_blackout = False
+
+        # init pattern
+        self._set_pattern_checked(None)
+        self.state.pattern_idx = None
+
         self._on_controls_changed()
+        self._update_locks_from_fx()
         QTimer.singleShot(0, self._apply_responsive)
+
+    def _dmx_manual_override(self):
+        self._dmx_forced_by_channels = False
+
+    # ---------------- manual color toggle logic ----------------
+    def _set_manual_color_checked(self, idx: Optional[int]):
+        for i, b in enumerate(self.color_btns):
+            b.blockSignals(True)
+            b.setChecked(idx is not None and i == idx)
+            b.blockSignals(False)
+        self._selected_color_idx = idx
+
+    def _on_color_clicked(self, idx: int, checked: bool):
+        if (self.state.fx or "").strip():
+            self._set_manual_color_checked(self._selected_color_idx)
+            return
+
+        if checked:
+            self.state.manual_blackout = False
+            self.state.color_slot = int(np.clip(idx, 0, len(COLOR_SLOTS) - 1))
+            self._set_manual_color_checked(idx)
+        else:
+            self.state.manual_blackout = True
+            self._set_manual_color_checked(None)
+
+        self._on_controls_changed()
+
+    # ---------------- pattern toggle logic ----------------
+    def _set_pattern_checked(self, idx: Optional[int]):
+        for i, b in enumerate(self.pat_btns):
+            b.blockSignals(True)
+            b.setChecked(idx is not None and i == idx)
+            b.blockSignals(False)
+        self._selected_pattern_idx = idx
+
+    def _on_pattern_clicked(self, idx: int, checked: bool):
+        # pattern can be controlled anytime (even when FX active)
+        if checked:
+            self.state.pattern_idx = int(np.clip(idx, 0, len(PATTERN_RANGES) - 1))
+            self._set_pattern_checked(self.state.pattern_idx)
+        else:
+            self.state.pattern_idx = None
+            self._set_pattern_checked(None)
+        self._on_controls_changed()
+
+    # ---------------- locking behavior ----------------
+    def _update_locks_from_fx(self):
+        fx_active = bool((self.state.fx or "").strip())
+
+        # FX controls color + movement:
+        for b in self.color_btns:
+            b.setEnabled(not fx_active)
+
+        self.sw_auto_move.setEnabled(not fx_active)
+
+        pan_tilt_allowed = (not fx_active) and (not self.state.auto_move)
+        self.card_pan.slider.setEnabled(pan_tilt_allowed)
+        self.card_tilt.slider.setEnabled(pan_tilt_allowed)
+
+        if fx_active and self.state.manual_blackout:
+            self.state.manual_blackout = False
+            self._set_manual_color_checked(int(self.state.color_slot))
+
+    def _apply_preset(self, preset_name: str):
+        k = _fx_key(preset_name)
+
+        color_slot = int(self.state.color_slot)
+        flashing = int(self.state.flashing)
+        auto_move = True
+        auto_audio = False
+
+        if k == "clean club wash":
+            color_slot = 11; flashing = 0
+        elif k == "build drop":
+            color_slot = 6; flashing = 0
+        elif k == "techno warehouse":
+            color_slot = 3; flashing = 80
+        elif k == "festival hands-up":
+            color_slot = 4; flashing = 130
+        elif k == "warm lounge":
+            color_slot = 9; flashing = 0
+        elif k == "rb groove":
+            color_slot = 8; flashing = 20
+        elif k == "dnb hard drop":
+            color_slot = 0; flashing = 235
+        elif k == "lightning storm":
+            color_slot = 0; flashing = 0
+
+        self.sw_auto.blockSignals(True)
+        self.sw_auto_move.blockSignals(True)
+        self.card_flash.slider.blockSignals(True)
+
+        try:
+            self.sw_auto.setChecked(auto_audio)
+            self.sw_auto_move.setChecked(auto_move)
+            self.card_flash.slider.setValue(int(np.clip(flashing, 0, 255)))
+            self.state.color_slot = int(np.clip(color_slot, 0, len(COLOR_SLOTS) - 1))
+            self._set_manual_color_checked(int(self.state.color_slot))
+        finally:
+            self.card_flash.slider.blockSignals(False)
+            self.sw_auto_move.blockSignals(False)
+            self.sw_auto.blockSignals(False)
+
+        self._on_controls_changed()
+        self._update_locks_from_fx()
+
+    def _on_fx_clicked(self, btn: QToolButton, checked: bool):
+        if checked:
+            if self._active_fx_btn is not None and self._active_fx_btn is not btn:
+                self._active_fx_btn.blockSignals(True)
+                self._active_fx_btn.setChecked(False)
+                self._active_fx_btn.blockSignals(False)
+            self._active_fx_btn = btn
+            self.state.fx = btn.text().strip().title()
+            self.status_lbl.setText(f"FX: {self.state.fx}")
+            self._apply_preset(self.state.fx)
+        else:
+            if self._active_fx_btn is btn:
+                self._active_fx_btn = None
+            self.state.fx = ""
+            self.status_lbl.setText("FX: Off")
+            self._update_locks_from_fx()
+            self._on_controls_changed()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -1134,21 +1411,30 @@ class SinglePanel(QWidget):
         sh = h / float(self._base_h)
         s = float(np.clip(min(sw, sh), 0.58, 1.0))
 
-        for p in [self.top_panel, self.fx_panel, self.slider_panel, self.sim_panel, self.audio_panel, self.color_panel]:
+        for p in [self.top_panel, self.slider_panel, self.sim_panel, self.audio_panel, self.color_panel, self.fx_panel, self.pat_panel]:
             p.apply_scale(s)
 
         btn_h = int(max(34, round(48 * s)))
-        fx_h = int(max(30, round(56 * s)))
+        fx_h = int(max(28, round(44 * s)))
         for b in self._all_main_buttons:
             b.setMinimumHeight(btn_h)
         for b in self.fx_buttons.values():
             b.setMinimumHeight(fx_h)
+        for b in self.pat_btns:
+            b.setMinimumHeight(fx_h)
+
         for b in self._transport_buttons:
             b.setMinimumHeight(int(max(30, round(44 * s))))
 
+        ch_h = int(max(30, round(44 * s)))
+        for b in (self.btn_ch1, self.btn_ch2, self.btn_ch3, self.btn_ch4):
+            b.setMinimumHeight(ch_h)
+        for b in self.color_btns:
+            b.setMinimumHeight(ch_h)
+
         f_time = QFont("Segoe UI", int(max(11, round(14 * s))), 800)
         self.time_lbl.setFont(f_time)
-        for lb in [self.status_lbl, self.bpm_lbl, self.wav_lbl, self.time_cur, self.time_tot, self.color_hex] + self.switch_labels:
+        for lb in [self.status_lbl, self.bpm_lbl, self.audio_lbl, self.time_cur, self.time_tot] + self.switch_labels:
             f = lb.font()
             f.setPointSizeF(max(8.0, 10.0 * s))
             lb.setFont(f)
@@ -1159,35 +1445,28 @@ class SinglePanel(QWidget):
         self.visualizer.apply_scale(s)
         self.sim.apply_scale(s)
         self.scrub.setFixedHeight(int(max(18, round(22 * s))))
-        self.color_swatch.setMinimumHeight(int(max(56, round(86 * s))))
 
         narrow = self.width() < 1120
-        self.row_and_picker.setDirection(_box_dir_top_to_bottom() if narrow else _box_dir_left_to_right())
+        self.row_and_color.setDirection(_box_dir_top_to_bottom() if narrow else _box_dir_left_to_right())
+        self._apply_slider_row_geometry(s)
 
-        if narrow:
-            self.color_panel.setMaximumWidth(16777215)
-        else:
-            self.color_panel.setMaximumWidth(int(max(150, round(240 * s))))
-
-        self._apply_slider_row_geometry(s, narrow)
-
-    def _apply_slider_row_geometry(self, s: float, narrow: bool):
+    def _apply_slider_row_geometry(self, s: float):
         n = len(self.cards)
         spacing = int(max(4, round(8 * s)))
         self.row.setSpacing(spacing)
-        self.row_and_picker.setSpacing(int(max(6, round(12 * s))))
+        self.row_and_color.setSpacing(int(max(6, round(12 * s))))
 
         avail = self.row_box.width()
         if avail <= 10:
             avail = max(10, self.slider_panel.width() - 60)
 
-        if not narrow:
+        if self.row_and_color.direction() == _box_dir_left_to_right():
             avail -= (self.color_panel.width() + int(max(6, round(12 * s))))
 
         avail = max(10, avail)
 
         card_w = int((avail - spacing * (n - 1)) / n)
-        card_w = int(np.clip(card_w, 54, 110))
+        card_w = int(np.clip(card_w, 54, 120))
 
         card_h = int(max(150, round(250 * s)))
         slider_h = int(max(90, round(180 * s)))
@@ -1216,81 +1495,46 @@ class SinglePanel(QWidget):
             self.scrub.setValue(int(ratio * 1000))
             self.scrub.blockSignals(False)
 
-    def _set_swatch_color(self, r: int, g: int, b: int):
-        r = int(np.clip(r, 0, 255))
-        g = int(np.clip(g, 0, 255))
-        b = int(np.clip(b, 0, 255))
-        hexv = f"#{r:02X}{g:02X}{b:02X}"
-        self.color_hex.setText(hexv)
-        self.color_swatch.setText(f" {hexv}")
-        self.color_swatch.setStyleSheet(
-            f"QPushButton#ColorSwatch{{"
-            f"background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            f"stop:0 rgba({r},{g},{b},220), stop:1 rgba({r},{g},{b},140));"
-            f"}}"
-        )
-
-    def _pick_color_dialog(self):
-        current = QColor(int(self.card_r.slider.value()), int(self.card_g.slider.value()), int(self.card_b.slider.value()))
-        c = QColorDialog.getColor(current, self, "Pick Color")
-        if not c.isValid():
-            return
-        self._syncing_color = True
-        try:
-            self.card_r.slider.setValue(c.red())
-            self.card_g.slider.setValue(c.green())
-            self.card_b.slider.setValue(c.blue())
-        finally:
-            self._syncing_color = False
-        self._set_swatch_color(self.card_r.slider.value(), self.card_g.slider.value(), self.card_b.slider.value())
-        self._on_controls_changed()
-
-    def _on_fx_clicked(self, btn: QToolButton, checked: bool):
-        if checked:
-            if self._active_fx_btn is not None and self._active_fx_btn is not btn:
-                self._active_fx_btn.blockSignals(True)
-                self._active_fx_btn.setChecked(False)
-                self._active_fx_btn.blockSignals(False)
-            self._active_fx_btn = btn
-            self.state.fx = btn.text().strip().title()
-            self.status_lbl.setText(f"FX: {self.state.fx}")
-        else:
-            if self._active_fx_btn is btn:
-                self._active_fx_btn = None
-            self.state.fx = ""
-            self.status_lbl.setText("FX: Off")
-
     def _on_controls_changed(self, *_):
         self.state.preset_name = self.preset_name.text().strip() or "Untitled"
         self.state.intensity = int(self.card_dim.slider.value())
-        self.state.r = int(self.card_r.slider.value())
-        self.state.g = int(self.card_g.slider.value())
-        self.state.b = int(self.card_b.slider.value())
-        self.state.strobe_rate = int(self.card_st.slider.value())
+        self.state.flashing = int(self.card_flash.slider.value())
         self.state.pan = int(self.card_pan.slider.value())
         self.state.tilt = int(self.card_tilt.slider.value())
         self.state.auto_audio = bool(self.sw_auto.isChecked())
         self.state.auto_move = bool(self.sw_auto_move.isChecked())
 
+        self.state.ch_on = (
+            bool(self.btn_ch1.isChecked()),
+            bool(self.btn_ch2.isChecked()),
+            bool(self.btn_ch3.isChecked()),
+            bool(self.btn_ch4.isChecked()),
+        )
+
         self.card_dim.set_value_text(self.state.intensity)
-        self.card_r.set_value_text(self.state.r)
-        self.card_g.set_value_text(self.state.g)
-        self.card_b.set_value_text(self.state.b)
-        self.card_st.set_value_text(self.state.strobe_rate)
+        self.card_flash.set_value_text(self.state.flashing)
         self.card_pan.set_value_text(self.state.pan)
         self.card_tilt.set_value_text(self.state.tilt)
 
-        lock = bool(self.state.auto_move)
-        self.card_pan.slider.setEnabled(not lock)
-        self.card_tilt.slider.setEnabled(not lock)
+        self._update_locks_from_fx()
 
-        if not self._syncing_color:
-            self._set_swatch_color(self.state.r, self.state.g, self.state.b)
+        any_ch = any(self.state.ch_on)
+        if any_ch and not self.sw_dmx.isChecked():
+            self._dmx_forced_by_channels = True
+            self.sw_dmx.blockSignals(True)
+            self.sw_dmx.setChecked(True)
+            self.sw_dmx.blockSignals(False)
+
+        if (not any_ch) and self._dmx_forced_by_channels and self.sw_dmx.isChecked():
+            self._dmx_forced_by_channels = False
+            self.sw_dmx.blockSignals(True)
+            self.sw_dmx.setChecked(False)
+            self.sw_dmx.blockSignals(False)
 
     def set_pan_tilt_from_engine(self, pan: int, tilt: int):
         if not self.state.auto_move:
             return
-        pan = int(np.clip(pan, 0, 540))
+        pan = int(np.clip(pan, 0, 255))
         tilt = int(np.clip(tilt, 0, 180))
 
         self.card_pan.slider.blockSignals(True)
@@ -1307,7 +1551,7 @@ class SinglePanel(QWidget):
         self.state.tilt = tilt
 
     def set_loaded_file(self, path: str):
-        self.wav_lbl.setText(f"WAV: {path}")
+        self.audio_lbl.setText(f"AUDIO: {path}")
 
     def update_visualizer(self, feat: AudioFeatures):
         self.visualizer.update_from_spectrum(feat.spectrum)
@@ -1324,17 +1568,13 @@ class MainWindow(QMainWindow):
         self.ui = SinglePanel()
         self.setCentralWidget(self.ui)
 
-        # ---------- OUTPUT ENGINE ----------
         self.output = OutputEngine()
-
-        # ✅ OPTION 1: Art-Net -> QLC+ -> USB DMX
-        # QLC+ screenshot shows "ArtNet Universe = 0" for Universe 1.
         self.output_cfg = OutputConfig(
             enabled=False,
             protocol="artnet",
             target_ip="127.0.0.1",
-            universe=0,          # MUST match QLC+ ArtNet Universe
-            start_address=1,     # your fixture DMX address is 001
+            universe=0,
+            start_address=1,
             fps=30,
         )
         self.output.apply_config(self.output_cfg)
@@ -1344,7 +1584,6 @@ class MainWindow(QMainWindow):
         self.output_timer.timeout.connect(self.output.tick)
         self.output_timer.start()
 
-        # ---------- AUDIO THREAD ----------
         self.file_thread = QThread(self)
         self.file_worker = AudioFileWorker()
         self.file_worker.moveToThread(self.file_thread)
@@ -1354,7 +1593,7 @@ class MainWindow(QMainWindow):
         self.file_worker.position.connect(self._on_audio_position)
         self.file_worker.error.connect(self._on_audio_error)
 
-        self.ui.import_clicked.connect(self._import_wav)
+        self.ui.import_clicked.connect(self._import_audio)
         self.ui.play_clicked.connect(self._play)
         self.ui.stop_clicked.connect(self._stop)
         self.ui.replay_clicked.connect(self._replay)
@@ -1364,12 +1603,15 @@ class MainWindow(QMainWindow):
         self._latest_feat = AudioFeatures()
         self._last_t = time.monotonic()
 
+        self._bd_drop_until = 0.0
+        self._bd_phase = 0.0
+
         self.frame_timer = QTimer(self)
         self.frame_timer.setInterval(33)
         self.frame_timer.timeout.connect(self._frame_tick)
         self.frame_timer.start()
 
-        self._wav_path: Optional[str] = None
+        self._audio_path: Optional[str] = None
 
     def closeEvent(self, event):
         try:
@@ -1387,17 +1629,22 @@ class MainWindow(QMainWindow):
             pass
         super().closeEvent(event)
 
-    def _import_wav(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import WAV", os.getcwd(), "WAV Files (*.wav)")
+    def _import_audio(self):
+        # Wider filter: soundfile handles many; pydub+ffmpeg handles mp3/m4a/aac/etc
+        filt = (
+            "Audio Files (*.wav *.mp3 *.flac *.ogg *.aiff *.aif *.m4a *.aac *.wma);;"
+            "All Files (*.*)"
+        )
+        path, _ = QFileDialog.getOpenFileName(self, "Import Audio", os.getcwd(), filt)
         if not path:
             return
-        self._wav_path = path
+        self._audio_path = path
         self.ui.set_loaded_file(path)
-        QTimer.singleShot(0, lambda: self.file_worker.load_wav(path))
+        QTimer.singleShot(0, lambda: self.file_worker.load_audio(path))
 
     def _play(self):
-        if not self._wav_path:
-            QMessageBox.information(self, "No WAV", "Click IMPORT first.")
+        if not self._audio_path:
+            QMessageBox.information(self, "No Audio", "Click IMPORT first.")
             return
         QTimer.singleShot(0, self.file_worker.play)
 
@@ -1405,8 +1652,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.file_worker.stop)
 
     def _replay(self):
-        if not self._wav_path:
-            QMessageBox.information(self, "No WAV", "Click IMPORT first.")
+        if not self._audio_path:
+            QMessageBox.information(self, "No Audio", "Click IMPORT first.")
             return
         QTimer.singleShot(0, self.file_worker.replay)
 
@@ -1414,9 +1661,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda r=ratio: self.file_worker.seek_ratio(r))
 
     def _on_audio_features(self, feat_obj):
-        feat: AudioFeatures = feat_obj
-        self._latest_feat = feat
-        self.ui.update_visualizer(feat)
+        self._latest_feat = feat_obj
+        self.ui.update_visualizer(self._latest_feat)
 
     def _on_audio_position(self, cur_sec: float, total_sec: float):
         self.ui.set_player_position(cur_sec, total_sec)
@@ -1424,133 +1670,124 @@ class MainWindow(QMainWindow):
     def _on_audio_error(self, msg: str):
         QMessageBox.critical(self, "Audio Error", msg)
 
+    def _effective_color_slot(self, now: float) -> int:
+        fx = _fx_key(self.ui.state.fx)
+
+        if fx == "clean club wash":
+            return 11 if (int(now / 6.0) % 2 == 0) else 10
+        if fx == "build drop":
+            return 0 if (now < self._bd_drop_until) else 6
+        if fx == "techno warehouse":
+            return 3 if (int(now / 8.0) % 2 == 0) else 6
+        if fx == "festival hands-up":
+            cycle = [1, 2, 3, 4]
+            return cycle[int(now * 1.6) % len(cycle)]
+        if fx == "warm lounge":
+            return 9 if (int(now / 10.0) % 2 == 0) else 5
+        if fx == "rb groove":
+            return 8 if (int(now / 9.0) % 2 == 0) else 6
+        if fx == "dnb hard drop":
+            return 0
+        if fx == "lightning storm":
+            return 0
+
+        return int(self.ui.state.color_slot)
+
     def _frame_tick(self):
         now = time.monotonic()
         dt = max(0.001, now - self._last_t)
         self._last_t = now
 
-        intensity, r, g, b, st_on, pan_out, tilt_out = self.fx.tick(self.ui.state, self._latest_feat, dt, now)
+        fx_key = _fx_key(self.ui.state.fx)
+
+        if fx_key == "build drop":
+            if (self._latest_feat.peak or 0.0) > 0.02:
+                self._bd_drop_until = max(self._bd_drop_until, now + 0.65)
+
+        intensity, st_on, pan_out, tilt_out = self.fx.tick(self.ui.state, self._latest_feat, dt, now)
         self.ui.set_pan_tilt_from_engine(pan_out, tilt_out)
 
         fx_name = self.ui.state.fx if self.ui.state.fx else "Off"
-        self.ui.sim.set_state(intensity, r, g, b, st_on, fx_name, pan_out, tilt_out)
+        ch_mode = any(self.ui.state.ch_on)
 
-        # ---------------- DMX OUTPUT (DJScorpio 14CH - manual-matched) ----------------
+        slot = self._effective_color_slot(now)
+        rgb = color_slot_to_rgb(slot)
+
+        forced_flashing = None
+        if fx_key == "build drop" and now < self._bd_drop_until:
+            intensity = 100
+            forced_flashing = 210
+            hz = FxEngine.flashing_value_to_hz(forced_flashing)
+            self._bd_phase += dt * hz
+            st_on = (int(self._bd_phase) % 2) == 0
+
+        if (not fx_key) and self.ui.state.manual_blackout:
+            intensity = 0
+            st_on = False
+
+        # Simulation
+        if ch_mode:
+            levels = [intensity if on else 0 for on in self.ui.state.ch_on]
+            if not st_on:
+                levels = [0, 0, 0, 0]
+            self.ui.sim.set_four_lights(levels, rgb, st_on, fx_name)
+        else:
+            self.ui.sim.set_state(intensity, rgb, st_on, fx_name, pan_out, tilt_out)
+
+        # DMX OUTPUT
         if HAS_DMX:
             try:
                 self.output_cfg.enabled = bool(self.ui.sw_dmx.isChecked())
-                self.output_cfg.blackout = (self.ui.state.fx.strip().lower() == "blackout")
+                self.output_cfg.blackout = False
                 self.output.apply_config(self.output_cfg)
 
-                fx = (self.ui.state.fx or "Off").strip().upper()
-                bpm = float(getattr(self._latest_feat, "bpm", 0.0) or 0.0)
-
-                def clamp01(x: float) -> float:
-                    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
-
                 dimmer_255 = int(max(0, min(255, (float(intensity) / 100.0) * 255.0)))
-
-                pan_255 = int(max(0, min(255, (float(pan_out) / 540.0) * 255.0)))
+                pan_255 = int(np.clip(pan_out, 0, 255))
                 tilt_255 = int(max(0, min(255, (float(tilt_out) / 180.0) * 255.0)))
+
                 pan_fine = 0
                 tilt_fine = 0
-
                 motor_speed = 0
 
-                rate = int(getattr(self.ui.state, "strobe_rate", 0))
-                if (not st_on) and fx not in ("STROBE", "FLASH", "LIGHTNING"):
-                    flash = 0
-                else:
-                    if rate <= 0:
-                        flash = 32
-                    else:
-                        flash = int(16 + (min(rate, 20) / 20.0) * (255 - 16))
+                flashing_val = int(np.clip(self.ui.state.flashing, 0, 255))
+                if forced_flashing is not None:
+                    flashing_val = int(forced_flashing)
+                flashing_dmx = 0 if flashing_val <= 15 else flashing_val
 
-                def wheel_value_from_rgb(rr: int, gg: int, bb: int) -> int:
-                    wheel = [
-                        (5,  (255, 255, 255)),  # white
-                        (15, (255, 0, 0)),      # red
-                        (25, (0, 255, 0)),      # green
-                        (35, (0, 0, 255)),      # blue
-                        (45, (255, 255, 0)),    # yellow
-                        (55, (255, 140, 0)),    # orange
-                        (65, (160, 0, 255)),    # purple
-                        (75, (120, 70, 20)),    # brown
-                        (85, (255, 0, 90)),     # rose red
-                        (95, (255, 180, 120)),  # warming
-                        (105, (120, 255, 120)), # light green
-                        (115, (120, 180, 255)), # light blue
-                    ]
-                    best_v = 5
-                    best_d = 10**18
-                    for v, (wr, wg, wb) in wheel:
-                        d = (rr - wr) ** 2 + (gg - wg) ** 2 + (bb - wb) ** 2
-                        if d < best_d:
-                            best_d = d
-                            best_v = v
-                    return best_v
+                color_dmx = color_slot_to_dmx(slot)
+                pattern_dmx = pattern_idx_to_dmx(self.ui.state.pattern_idx)
 
-                if fx == "RAINBOW":
-                    t01 = clamp01(bpm / 200.0) if bpm > 0 else 0.5
-                    color = int(187 - t01 * (187 - 120))  # forward
-                elif fx == "WAVE":
-                    t01 = clamp01(bpm / 200.0) if bpm > 0 else 0.5
-                    color = int(188 + t01 * (255 - 188))  # reverse
-                else:
-                    color = wheel_value_from_rgb(int(r), int(g), int(b))
-
-                if fx == "CHASE":
-                    t01 = clamp01(bpm / 200.0) if bpm > 0 else 0.5
-                    pattern = int(217 - t01 * (217 - 180))
-                elif fx == "WAVE":
-                    t01 = clamp01(bpm / 200.0) if bpm > 0 else 0.5
-                    pattern = int(218 + t01 * (255 - 218))
-                elif fx == "PULSE":
-                    pattern = 92
-                elif fx == "LIGHTNING":
-                    pattern = 2
-                else:
-                    pattern = 0
-
-                if fx in ("FLASH", "STROBE"):
-                    t01 = clamp01(bpm / 200.0) if bpm > 0 else 0.5
-                    prism = int(128 + t01 * (255 - 128))
-                else:
-                    prism = 0
-
-                if bool(self.ui.sw_auto.isChecked()):
-                    mode = 220
-                elif fx in ("CHASE", "RAINBOW", "WAVE"):
-                    mode = 80
-                else:
-                    mode = 0
-
+                prism = 0
+                mode = 80 if self.ui.sw_auto.isChecked() else 0
                 reset = 0
+                strip_fx = 160 if self.ui.state.fx else 0
+                strip_speed = 120
 
-                strip_fx = 0 if fx in ("OFF", "BLACKOUT") else 160
-                if bpm > 0:
-                    t01 = clamp01(bpm / 200.0)
-                    strip_speed = int(255 - t01 * 255)  # 0 fast -> 255 slow
+                if ch_mode:
+                    self.output_cfg.start_address = 1
+                    d = [dimmer_255 if on else 0 for on in self.ui.state.ch_on]
+                    if not st_on:
+                        d = [0, 0, 0, 0]
+                    self.output.set_channels_from_values_0_255(d)
                 else:
-                    strip_speed = 120
-
-                values = [
-                    pan_255,      # CH1
-                    pan_fine,     # CH2
-                    tilt_255,     # CH3
-                    tilt_fine,    # CH4
-                    motor_speed,  # CH5
-                    dimmer_255,   # CH6
-                    flash,        # CH7
-                    color,        # CH8
-                    pattern,      # CH9
-                    prism,        # CH10
-                    mode,         # CH11
-                    reset,        # CH12
-                    strip_fx,     # CH13
-                    strip_speed,  # CH14
-                ]
-                self.output.set_channels_from_values_0_255(values)
+                    self.output_cfg.start_address = 1
+                    values = [
+                        pan_255,        # CH1
+                        pan_fine,       # CH2
+                        tilt_255,       # CH3
+                        tilt_fine,      # CH4
+                        motor_speed,    # CH5
+                        dimmer_255,     # CH6
+                        flashing_dmx,   # CH7
+                        color_dmx,      # CH8
+                        pattern_dmx,    # CH9
+                        prism,          # CH10
+                        mode,           # CH11
+                        reset,          # CH12
+                        strip_fx,       # CH13
+                        strip_speed,    # CH14
+                    ]
+                    self.output.set_channels_from_values_0_255(values)
             except Exception:
                 pass
 

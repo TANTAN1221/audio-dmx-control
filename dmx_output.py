@@ -1,4 +1,4 @@
-# dmx_output.py
+# dmx_output.py  (UNCHANGED)
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional
@@ -25,14 +25,13 @@ class OutputConfig:
 
     # Art-Net settings
     target_ip: str = "127.0.0.1"
-    universe: int = 0  # Art-Net "Net/SubUni" (0..32767, but typically 0)
+    universe: int = 0  # Art-Net "Net/SubUni"
 
     # DMX addressing + send rate
     start_address: int = 1
     fps: int = 30
 
 
-# ---------------- USB DMX Pro ----------------
 class _UsbDmxProSender:
     START = 0x7E
     END = 0xE7
@@ -52,15 +51,14 @@ class _UsbDmxProSender:
     def send_512(self, dmx512: bytes):
         if len(dmx512) != 512:
             raise ValueError("dmx512 must be 512 bytes")
-        payload = b"\x00" + dmx512  # start code + 512 bytes
-        length = len(payload)        # 513
+        payload = b"\x00" + dmx512
+        length = len(payload)
         pkt = bytearray([self.START, self.LABEL_SEND_DMX, length & 0xFF, (length >> 8) & 0xFF])
         pkt += payload
         pkt.append(self.END)
         self.ser.write(pkt)
 
 
-# ---------------- Art-Net ----------------
 class _ArtNetSender:
     PORT = 6454
 
@@ -77,13 +75,6 @@ class _ArtNetSender:
 
     @staticmethod
     def _make_artdmx_packet(universe: int, dmx512: bytes, seq: int = 0) -> bytes:
-        # ArtDMX packet:
-        # ID "Art-Net\0" (8)
-        # OpCode 0x5000 (little endian)
-        # ProtVer 14 (big endian)
-        # Sequence, Physical
-        # Universe (little endian) = SubUni + Net/Subnet combined
-        # Length (big endian)
         header = bytearray()
         header += b"Art-Net\x00"
         header += (0x5000).to_bytes(2, "little")
