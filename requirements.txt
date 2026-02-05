@@ -1,5 +1,0 @@
-PyQt6
-numpy
-sounddevice
-soundfile
-pyserial
